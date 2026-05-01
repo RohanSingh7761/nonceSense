@@ -67,6 +67,22 @@ interface TokenMetadata {
   decimals: number;
 }
 
+interface TokenListEntry {
+  chainId: number;
+  address: string;
+  symbol: string;
+  decimals: number;
+}
+
+const UNISWAP_TOKEN_LIST_URL = 'https://tokens.uniswap.org';
+const TOKEN_LIST_TTL_MS = 10 * 60 * 1000;
+let tokenListCache:
+  | {
+      fetchedAt: number;
+      tokens: TokenListEntry[];
+    }
+  | undefined;
+
 function getNetworkLabel(chainId: number): string {
   if (chainId === 11155111) return 'Sepolia';
   if (chainId === 1) return 'Ethereum Mainnet';
@@ -93,7 +109,26 @@ function getTokenDirectory(chainId: number): Record<string, TokenMetadata> {
   return {};
 }
 
-function resolveToken(chainId: number, tokenInput: string, decimalsOverride?: string): TokenMetadata {
+async function loadTokenList(): Promise<TokenListEntry[]> {
+  if (tokenListCache && Date.now() - tokenListCache.fetchedAt < TOKEN_LIST_TTL_MS) {
+    return tokenListCache.tokens;
+  }
+
+  const response = await fetch(UNISWAP_TOKEN_LIST_URL);
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Uniswap token list: ${response.status}`);
+  }
+
+  const parsed = (await response.json()) as { tokens?: TokenListEntry[] };
+  const tokens = parsed.tokens ?? [];
+  tokenListCache = {
+    fetchedAt: Date.now(),
+    tokens,
+  };
+  return tokens;
+}
+
+async function resolveToken(chainId: number, tokenInput: string, decimalsOverride?: string): Promise<TokenMetadata> {
   if (tokenInput.startsWith('0x')) {
     return {
       symbol: 'TOKEN',
@@ -105,11 +140,25 @@ function resolveToken(chainId: number, tokenInput: string, decimalsOverride?: st
   const normalized = tokenInput.toUpperCase();
   const directory = getTokenDirectory(chainId);
   const found = directory[normalized];
-  if (!found) {
+  if (found) {
+    return found;
+  }
+
+  const tokens = await loadTokenList();
+  const candidates = tokens.filter(
+    (token) => token.chainId === chainId && token.symbol.toUpperCase() === normalized,
+  );
+
+  if (candidates.length === 0) {
     throw new Error(`Unsupported token "${tokenInput}" on ${getNetworkLabel(chainId)}.`);
   }
 
-  return found;
+  const selected = candidates[0];
+  return {
+    symbol: selected.symbol,
+    address: selected.address,
+    decimals: selected.decimals,
+  };
 }
 
 function parseConditionalBalanceQuote(message: string): { thresholdEth: string; tokenOut: string } | undefined {
