@@ -14,6 +14,13 @@ const FACTORY_ABI = [
   'function getPool(address tokenA,address tokenB,uint24 fee) external view returns (address)',
 ];
 
+const WETH_ABI = [
+  'function deposit() payable',
+  'function approve(address spender,uint256 value) returns (bool)',
+  'function allowance(address owner,address spender) view returns (uint256)',
+  'function balanceOf(address owner) view returns (uint256)',
+];
+
 const DEFAULT_ROUTER = '0xE592427A0AEce92De3Edee1F18E0157C05861564';
 const DEFAULT_QUOTER = '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
 const SEPOLIA_ROUTER = '0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E';
@@ -132,6 +139,25 @@ export async function swapExactInputSingle(input: UniswapSwapInput): Promise<Uni
   const slippage = BigInt(input.slippageBps);
   const amountOutMinimum = (quoteOut * (10_000n - slippage)) / 10_000n;
 
+  if (input.useNativeIn) {
+    const weth = new ethers.Contract(input.tokenIn, WETH_ABI, signer);
+    const owner = await signer.getAddress();
+    const amountIn = BigInt(input.amountIn);
+
+    const wethBalance = (await weth.balanceOf(owner)) as bigint;
+    if (wethBalance < amountIn) {
+      const wrapValue = amountIn - wethBalance;
+      const wrapTx = await weth.deposit({ value: wrapValue });
+      await wrapTx.wait();
+    }
+
+    const allowance = (await weth.allowance(owner, router)) as bigint;
+    if (allowance < amountIn) {
+      const approveTx = await weth.approve(router, ethers.MaxUint256);
+      await approveTx.wait();
+    }
+  }
+
   const contract = new ethers.Contract(router, SWAP_ROUTER_ABI, signer);
   const params = {
     tokenIn: input.tokenIn,
@@ -144,9 +170,7 @@ export async function swapExactInputSingle(input: UniswapSwapInput): Promise<Uni
     sqrtPriceLimitX96: 0,
   };
 
-  const tx = input.useNativeIn
-    ? await contract.exactInputSingle(params, { value: BigInt(input.amountIn) })
-    : await contract.exactInputSingle(params);
+  const tx = await contract.exactInputSingle(params);
 
   return { transactionHash: tx.hash as string };
 }
