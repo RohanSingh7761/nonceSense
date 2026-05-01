@@ -1,6 +1,13 @@
+import 'dotenv/config';
+
+import { GoogleGenAI } from '@google/genai';
+import { createInterface } from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+
 import { getConfigPath, loadConfig, setActiveUserMode, setActiveUserWallet } from './config/store.js';
 import {
   getNativeBalance,
+  getWalletPortfolio,
   quoteExactInputSingle,
   swapExactInputSingle,
   transferNative,
@@ -36,7 +43,12 @@ type CommandName =
 interface ParsedArgs {
   command?: CommandName;
   flags: Record<string, string | boolean>;
-  positionals: string[];
+}
+
+interface ActionPlan {
+  action: CommandName | 'none';
+  flags: Record<string, string>;
+  reply: string;
 }
 
 const VALID_MODES: UserMode[] = [
@@ -45,21 +57,31 @@ const VALID_MODES: UserMode[] = [
   'limited-auto-execution',
 ];
 
+const EXECUTABLE_ACTIONS: CommandName[] = [
+  'setup',
+  'recommend',
+  'execute',
+  'mode',
+  'wallet-balance',
+  'wallet-transfer',
+  'swap-quote',
+  'swap-execute',
+  'recent-recommendations',
+  'trigger-eval',
+  'workflow-smoke',
+];
+
 function parseArgv(argv: string[]): ParsedArgs {
   const [candidateCommand, ...rest] = argv;
   const command = isCommand(candidateCommand) ? candidateCommand : undefined;
   const source = command ? rest : argv;
   const flags: Record<string, string | boolean> = {};
-  const positionals: string[] = [];
 
   for (let index = 0; index < source.length; index += 1) {
     const token = source[index];
-
     if (!token.startsWith('--')) {
-      positionals.push(token);
       continue;
     }
-
     const withoutPrefix = token.slice(2);
     const separatorIndex = withoutPrefix.indexOf('=');
     if (separatorIndex >= 0) {
@@ -68,18 +90,16 @@ function parseArgv(argv: string[]): ParsedArgs {
       flags[key] = value;
       continue;
     }
-
     const nextToken = source[index + 1];
     if (nextToken && !nextToken.startsWith('--')) {
       flags[withoutPrefix] = nextToken;
       index += 1;
       continue;
     }
-
     flags[withoutPrefix] = true;
   }
 
-  return { command, flags, positionals };
+  return { command, flags };
 }
 
 function isCommand(value: string | undefined): value is CommandName {
@@ -108,7 +128,7 @@ function asStringFlag(flags: Record<string, string | boolean>, key: string): str
 function requireStringFlags(
   flags: Record<string, string | boolean>,
   keys: string[],
-): { ok: true; values: Record<string, string> } | { ok: false; missing: string[] } {
+): Record<string, string> {
   const values: Record<string, string> = {};
   const missing: string[] = [];
   for (const key of keys) {
@@ -120,32 +140,9 @@ function requireStringFlags(
     values[key] = value;
   }
   if (missing.length > 0) {
-    return { ok: false, missing };
+    throw new Error(`Missing required flags: ${missing.join(', ')}`);
   }
-  return { ok: true, values };
-}
-
-function printHelp(): void {
-  console.log(`NonceSense CLI
-
-Usage:
-  npm run dev -- <command> [--flags]
-
-Commands:
-  help
-  version
-  setup --wallet <address> --rpc <url> [--chainId <number>]
-  wallet-balance
-  wallet-transfer --to <address> --amountEth <amount>
-  swap-quote --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>]
-  swap-execute --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>] [--slippageBps <number>]
-  recommend --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount>
-  execute --recommendationId <id> [--confirm true] [--amountUsd <number>]
-  recent-recommendations [--limit <number>]
-  trigger-eval --targetPrice <number> --currentPrice <number> --direction <above|below> --tokenIn <symbol> --tokenOut <symbol>
-  workflow-smoke --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount> --targetPrice <number> --currentPrice <number>
-  mode --set <recommendation-only|assisted-execution|limited-auto-execution>
-`);
+  return values;
 }
 
 function parseBoolean(value: string | undefined): boolean {
@@ -168,449 +165,342 @@ function parseNumber(value: string, fieldName: string): number {
   return parsed;
 }
 
-async function run(): Promise<void> {
-  const parsed = parseArgv(process.argv.slice(2));
-  const command = parsed.command ?? 'help';
+function printHelp(): void {
+  console.log(`NonceSense CLI
 
+Usage:
+  npm run dev                      # chat mode
+  npm run dev -- <command> [--flags]
+
+Commands:
+  help
+  version
+  setup --wallet <address> [--rpc <url>] [--chainId <number>]
+  wallet-balance
+  wallet-transfer --to <address> --amountEth <amount>
+  swap-quote --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>]
+  swap-execute --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>] [--slippageBps <number>]
+  recommend --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount>
+  execute --recommendationId <id> [--confirm true] [--amountUsd <number>]
+  recent-recommendations [--limit <number>]
+  trigger-eval --targetPrice <number> --currentPrice <number> --direction <above|below> --tokenIn <symbol> --tokenOut <symbol>
+  workflow-smoke --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount> --targetPrice <number> --currentPrice <number>
+  mode --set <recommendation-only|assisted-execution|limited-auto-execution>
+`);
+}
+
+async function getActiveUserFromConfig() {
+  const config = await loadConfig();
+  const activeUser = config.users.find((user) => user.id === config.activeUserId);
+  if (!activeUser) {
+    throw new Error('Active user not found.');
+  }
+  return { config, activeUser };
+}
+
+function extractJsonObject(text: string): string {
+  const fenceMatch = text.match(/```json\s*([\s\S]*?)```/i);
+  if (fenceMatch && fenceMatch[1]) {
+    return fenceMatch[1].trim();
+  }
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    return text.slice(start, end + 1);
+  }
+  throw new Error('No JSON object found in model response.');
+}
+
+async function planFromUserMessage(userMessage: string): Promise<ActionPlan> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return {
+      action: 'none',
+      flags: {},
+      reply:
+        'GEMINI_API_KEY is not configured. Add it in .env, then restart `npm run dev`.',
+    };
+  }
+
+  const ai = new GoogleGenAI({ apiKey });
+  const prompt = `You are a router for a crypto CLI. Convert user chat into one command action.
+
+Return STRICT JSON only:
+{
+  "action": "setup|wallet-balance|wallet-transfer|swap-quote|swap-execute|recommend|execute|mode|recent-recommendations|trigger-eval|workflow-smoke|none",
+  "flags": { "key": "value" },
+  "reply": "short user-facing sentence"
+}
+
+Rules:
+- Prefer wallet-balance for balance queries.
+- For mode changes, use action=mode and flags.set.
+- For setup, infer rpc from ALCHEMY_SEPOLIA_ENDPOINT if user asks for sepolia and no rpc specified.
+- If required values are missing, keep action as best guess and include missing details in reply.
+- Never invent addresses/private keys.
+- Keep flags string-to-string.
+
+User message:
+${userMessage}`;
+
+  const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
+  const response = await ai.models.generateContent({
+    model,
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+  });
+  const raw = response.text ?? '';
+  const parsed = JSON.parse(extractJsonObject(raw)) as ActionPlan;
+  return {
+    action: parsed.action,
+    flags: parsed.flags ?? {},
+    reply: parsed.reply ?? 'Working on it.',
+  };
+}
+
+async function executeCommand(
+  command: CommandName,
+  flags: Record<string, string | boolean>,
+): Promise<unknown> {
   switch (command) {
-    case 'help': {
+    case 'help':
       printHelp();
-      return;
-    }
-    case 'version': {
-      console.log('NonceSense CLI v0.1.0');
-      return;
-    }
+      return { command: 'help' };
+    case 'version':
+      return { command: 'version', version: '0.2.0' };
     case 'setup': {
-      const required = requireStringFlags(parsed.flags, ['wallet', 'rpc']);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
+      const wallet = asStringFlag(flags, 'wallet');
+      if (!wallet) {
+        throw new Error('Missing required flag: --wallet');
       }
-      const chainIdRaw = asStringFlag(parsed.flags, 'chainId') ?? '1';
-      const chainId = Number(chainIdRaw);
-      if (!Number.isInteger(chainId) || chainId <= 0) {
-        console.error(`Invalid chainId: ${chainIdRaw}`);
-        process.exitCode = 1;
-        return;
+      const rpc =
+        asStringFlag(flags, 'rpc') ??
+        process.env.ALCHEMY_SEPOLIA_ENDPOINT ??
+        '';
+      if (!rpc) {
+        throw new Error('Missing RPC URL. Provide --rpc or set ALCHEMY_SEPOLIA_ENDPOINT.');
       }
-      const config = await setActiveUserWallet(required.values.wallet, required.values.rpc, chainId);
+      const chainIdRaw = asStringFlag(flags, 'chainId') ?? '11155111';
+      const chainId = parsePositiveInteger(chainIdRaw, 'chainId');
+      const config = await setActiveUserWallet(wallet, rpc, chainId);
       const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      console.log(
-        JSON.stringify(
-          {
-            command: 'setup',
-            saved: true,
-            configPath: getConfigPath(),
-            activeUser,
-          },
-          null,
-          2,
-        ),
+      return { command: 'setup', saved: true, configPath: getConfigPath(), activeUser };
+    }
+    case 'mode': {
+      const mode = asStringFlag(flags, 'set');
+      if (!mode) {
+        throw new Error('Missing required flag: --set');
+      }
+      if (!VALID_MODES.includes(mode as UserMode)) {
+        throw new Error(`Invalid mode: ${mode}`);
+      }
+      const config = await setActiveUserMode(mode as UserMode);
+      const activeUser = config.users.find((user) => user.id === config.activeUserId);
+      return { command: 'mode', saved: true, configPath: getConfigPath(), mode: activeUser?.mode };
+    }
+    case 'wallet-balance': {
+      const { activeUser } = await getActiveUserFromConfig();
+      const nativeBalance = await getNativeBalance(activeUser.wallet);
+      const portfolio = await getWalletPortfolio(activeUser.wallet);
+      return {
+        command: 'wallet-balance',
+        wallet: activeUser.wallet.address,
+        chainId: activeUser.wallet.chainId,
+        nativeBalance,
+        portfolio,
+      };
+    }
+    case 'wallet-transfer': {
+      const values = requireStringFlags(flags, ['to', 'amountEth']);
+      const { activeUser } = await getActiveUserFromConfig();
+      const privateKey = process.env.PRIVATE_KEY ?? '';
+      const tx = await transferNative(activeUser.wallet, privateKey, values.to, values.amountEth);
+      return {
+        command: 'wallet-transfer',
+        from: activeUser.wallet.address,
+        to: values.to,
+        amountEth: values.amountEth,
+        transactionHash: tx.transactionHash,
+      };
+    }
+    case 'swap-quote': {
+      const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amountIn']);
+      const { activeUser } = await getActiveUserFromConfig();
+      const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
+      const quote = await quoteExactInputSingle({
+        wallet: activeUser.wallet,
+        tokenIn: values.tokenIn,
+        tokenOut: values.tokenOut,
+        amountIn: values.amountIn,
+        fee,
+      });
+      return { command: 'swap-quote', quote };
+    }
+    case 'swap-execute': {
+      const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amountIn']);
+      const { activeUser } = await getActiveUserFromConfig();
+      const privateKey = process.env.PRIVATE_KEY ?? '';
+      const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
+      const slippageBps = parsePositiveInteger(
+        asStringFlag(flags, 'slippageBps') ?? '100',
+        'slippageBps',
       );
-      return;
+      const tx = await swapExactInputSingle({
+        wallet: activeUser.wallet,
+        privateKey,
+        tokenIn: values.tokenIn,
+        tokenOut: values.tokenOut,
+        amountIn: values.amountIn,
+        fee,
+        slippageBps,
+      });
+      return { command: 'swap-execute', transactionHash: tx.transactionHash };
     }
     case 'recommend': {
-      const required = requireStringFlags(parsed.flags, ['tokenIn', 'tokenOut', 'amount']);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
+      const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amount']);
+      const { activeUser } = await getActiveUserFromConfig();
       const recommendation: Recommendation = {
         id: crypto.randomUUID(),
         createdAt: new Date().toISOString(),
         request: {
           tokenIn: {
-            chainId: activeUser?.wallet.chainId ?? 1,
-            symbol: required.values.tokenIn,
-            address: asStringFlag(parsed.flags, 'tokenInAddress') ?? '',
-            decimals: parseInt(asStringFlag(parsed.flags, 'tokenInDecimals') ?? '18', 10),
+            chainId: activeUser.wallet.chainId,
+            symbol: values.tokenIn,
+            address: asStringFlag(flags, 'tokenInAddress') ?? '',
+            decimals: parseInt(asStringFlag(flags, 'tokenInDecimals') ?? '18', 10),
           },
           tokenOut: {
-            chainId: activeUser?.wallet.chainId ?? 1,
-            symbol: required.values.tokenOut,
-            address: asStringFlag(parsed.flags, 'tokenOutAddress') ?? '',
-            decimals: parseInt(asStringFlag(parsed.flags, 'tokenOutDecimals') ?? '18', 10),
+            chainId: activeUser.wallet.chainId,
+            symbol: values.tokenOut,
+            address: asStringFlag(flags, 'tokenOutAddress') ?? '',
+            decimals: parseInt(asStringFlag(flags, 'tokenOutDecimals') ?? '18', 10),
           },
-          amountIn: required.values.amount,
-          slippageBps: parseInt(asStringFlag(parsed.flags, 'slippageBps') ?? '100', 10),
+          amountIn: values.amount,
+          slippageBps: parseInt(asStringFlag(flags, 'slippageBps') ?? '100', 10),
         },
-        rationale: `Mode=${activeUser?.mode ?? 'recommendation-only'}; based on CLI request`,
-        estimatedAmountOut: asStringFlag(parsed.flags, 'estimatedAmountOut') ?? '0',
+        rationale: `Mode=${activeUser.mode}; based on chat or CLI request`,
+        estimatedAmountOut: asStringFlag(flags, 'estimatedAmountOut') ?? '0',
         routeLabel: 'uniswap-v3',
         validUntil: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
       };
-
       await addRecommendation(recommendation);
-      console.log(
-        JSON.stringify(
-          {
-            command: 'recommend',
-            mode: activeUser?.mode ?? 'recommendation-only',
-            memoryPath: getMemoryPath(),
-            recommendation,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
+      return {
+        command: 'recommend',
+        mode: activeUser.mode,
+        memoryPath: getMemoryPath(),
+        recommendation,
+      };
     }
     case 'execute': {
-      const required = requireStringFlags(parsed.flags, ['recommendationId']);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const recommendation = await getRecommendationById(required.values.recommendationId);
+      const values = requireStringFlags(flags, ['recommendationId']);
+      const recommendation = await getRecommendationById(values.recommendationId);
       if (!recommendation) {
-        console.error(`Recommendation not found: ${required.values.recommendationId}`);
-        process.exitCode = 1;
-        return;
+        throw new Error(`Recommendation not found: ${values.recommendationId}`);
       }
 
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      if (!activeUser) {
-        console.error('Active user not found.');
-        process.exitCode = 1;
-        return;
-      }
-
+      const { activeUser } = await getActiveUserFromConfig();
       await logExecutionRequested(recommendation.id);
 
-      const amountUsdRaw = asStringFlag(parsed.flags, 'amountUsd');
+      const amountUsdRaw = asStringFlag(flags, 'amountUsd');
       const amountUsd = amountUsdRaw ? parseNumber(amountUsdRaw, 'amountUsd') : undefined;
       const decision = evaluateExecutionPolicy({
         mode: activeUser.mode,
         policy: activeUser.policy,
         tokenInSymbol: recommendation.request.tokenIn.symbol,
         amountUsd,
-        explicitConfirmation: parseBoolean(asStringFlag(parsed.flags, 'confirm')),
+        explicitConfirmation: parseBoolean(asStringFlag(flags, 'confirm')),
       });
-
       if (!decision.allowed) {
         await logExecutionFailed(recommendation.id, decision.reason);
-        console.error(decision.reason);
-        process.exitCode = 1;
-        return;
+        throw new Error(decision.reason);
       }
-
-      const privateKey = process.env.PRIVATE_KEY ?? '';
-      const fee = parsePositiveInteger(asStringFlag(parsed.flags, 'fee') ?? '3000', 'fee');
-      const slippageBps = parsePositiveInteger(
-        asStringFlag(parsed.flags, 'slippageBps') ?? `${recommendation.request.slippageBps}`,
-        'slippageBps',
-      );
 
       if (!recommendation.request.tokenIn.address || !recommendation.request.tokenOut.address) {
         const message =
-          'Recommendation missing token addresses. Re-run recommend with --tokenInAddress and --tokenOutAddress.';
+          'Recommendation missing token addresses. Re-run recommend with token addresses.';
         await logExecutionFailed(recommendation.id, message);
-        console.error(message);
-        process.exitCode = 1;
-        return;
+        throw new Error(message);
       }
 
-      try {
-        const tx = await swapExactInputSingle({
-          wallet: activeUser.wallet,
-          tokenIn: recommendation.request.tokenIn.address,
-          tokenOut: recommendation.request.tokenOut.address,
-          amountIn: recommendation.request.amountIn,
-          fee,
-          slippageBps,
-          privateKey,
-        });
-        await logExecutionSubmitted(recommendation.id, tx.transactionHash);
-        console.log(
-          JSON.stringify(
-            {
-              command: 'execute',
-              recommendationId: recommendation.id,
-              mode: activeUser.mode,
-              policyDecision: decision,
-              transactionHash: tx.transactionHash,
-            },
-            null,
-            2,
-          ),
-        );
-      } catch (error: unknown) {
-        const message = error instanceof Error ? error.message : String(error);
-        await logExecutionFailed(recommendation.id, message);
-        console.error(message);
-        process.exitCode = 1;
-      }
-      return;
-    }
-    case 'mode': {
-      const mode = asStringFlag(parsed.flags, 'set');
-      if (!mode) {
-        console.error('Missing required flag: --set');
-        process.exitCode = 1;
-        return;
-      }
-      if (!VALID_MODES.includes(mode as UserMode)) {
-        console.error(`Invalid mode: ${mode}`);
-        console.error(`Valid modes: ${VALID_MODES.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const config = await setActiveUserMode(mode as UserMode);
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      console.log(
-        JSON.stringify(
-          {
-            command: 'mode',
-            saved: true,
-            configPath: getConfigPath(),
-            mode: activeUser?.mode,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case 'wallet-balance': {
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      if (!activeUser) {
-        console.error('Active user not found.');
-        process.exitCode = 1;
-        return;
-      }
-      const balance = await getNativeBalance(activeUser.wallet);
-      console.log(
-        JSON.stringify(
-          {
-            command: 'wallet-balance',
-            wallet: activeUser.wallet.address,
-            chainId: activeUser.wallet.chainId,
-            balance,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case 'wallet-transfer': {
-      const required = requireStringFlags(parsed.flags, ['to', 'amountEth']);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      if (!activeUser) {
-        console.error('Active user not found.');
-        process.exitCode = 1;
-        return;
-      }
       const privateKey = process.env.PRIVATE_KEY ?? '';
-      const tx = await transferNative(
-        activeUser.wallet,
-        privateKey,
-        required.values.to,
-        required.values.amountEth,
-      );
-      console.log(
-        JSON.stringify(
-          {
-            command: 'wallet-transfer',
-            from: activeUser.wallet.address,
-            to: required.values.to,
-            amountEth: required.values.amountEth,
-            transactionHash: tx.transactionHash,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case 'swap-quote': {
-      const required = requireStringFlags(parsed.flags, ['tokenIn', 'tokenOut', 'amountIn']);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      if (!activeUser) {
-        console.error('Active user not found.');
-        process.exitCode = 1;
-        return;
-      }
-      const fee = parsePositiveInteger(asStringFlag(parsed.flags, 'fee') ?? '3000', 'fee');
-      const quote = await quoteExactInputSingle({
-        wallet: activeUser.wallet,
-        tokenIn: required.values.tokenIn,
-        tokenOut: required.values.tokenOut,
-        amountIn: required.values.amountIn,
-        fee,
-      });
-      console.log(
-        JSON.stringify(
-          {
-            command: 'swap-quote',
-            quote,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
-    }
-    case 'swap-execute': {
-      const required = requireStringFlags(parsed.flags, ['tokenIn', 'tokenOut', 'amountIn']);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      if (!activeUser) {
-        console.error('Active user not found.');
-        process.exitCode = 1;
-        return;
-      }
-      const privateKey = process.env.PRIVATE_KEY ?? '';
-      const fee = parsePositiveInteger(asStringFlag(parsed.flags, 'fee') ?? '3000', 'fee');
+      const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const slippageBps = parsePositiveInteger(
-        asStringFlag(parsed.flags, 'slippageBps') ?? '100',
+        asStringFlag(flags, 'slippageBps') ?? `${recommendation.request.slippageBps}`,
         'slippageBps',
       );
       const tx = await swapExactInputSingle({
         wallet: activeUser.wallet,
-        privateKey,
-        tokenIn: required.values.tokenIn,
-        tokenOut: required.values.tokenOut,
-        amountIn: required.values.amountIn,
+        tokenIn: recommendation.request.tokenIn.address,
+        tokenOut: recommendation.request.tokenOut.address,
+        amountIn: recommendation.request.amountIn,
         fee,
         slippageBps,
+        privateKey,
       });
-      console.log(
-        JSON.stringify(
-          {
-            command: 'swap-execute',
-            transactionHash: tx.transactionHash,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
+      await logExecutionSubmitted(recommendation.id, tx.transactionHash);
+      return {
+        command: 'execute',
+        recommendationId: recommendation.id,
+        mode: activeUser.mode,
+        transactionHash: tx.transactionHash,
+      };
     }
     case 'recent-recommendations': {
-      const limitRaw = asStringFlag(parsed.flags, 'limit') ?? '5';
+      const limitRaw = asStringFlag(flags, 'limit') ?? '5';
       const limit = parsePositiveInteger(limitRaw, 'limit');
       const recommendations = await listRecentRecommendations(limit);
-      console.log(
-        JSON.stringify(
-          {
-            command: 'recent-recommendations',
-            memoryPath: getMemoryPath(),
-            recommendations,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
+      return { command: 'recent-recommendations', memoryPath: getMemoryPath(), recommendations };
     }
     case 'trigger-eval': {
-      const required = requireStringFlags(parsed.flags, [
+      const values = requireStringFlags(flags, [
         'targetPrice',
         'currentPrice',
         'direction',
         'tokenIn',
         'tokenOut',
       ]);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-      const direction = required.values.direction;
-      if (direction !== 'above' && direction !== 'below') {
-        console.error('Invalid --direction, use above|below');
-        process.exitCode = 1;
-        return;
+      if (values.direction !== 'above' && values.direction !== 'below') {
+        throw new Error('Invalid direction, use above|below.');
       }
       const result = evaluateTrigger({
         condition: {
           id: 'adhoc',
           label: 'ad-hoc trigger',
           enabled: true,
-          tokenInSymbol: required.values.tokenIn,
-          tokenOutSymbol: required.values.tokenOut,
-          targetPrice: required.values.targetPrice,
-          direction,
+          tokenInSymbol: values.tokenIn,
+          tokenOutSymbol: values.tokenOut,
+          targetPrice: values.targetPrice,
+          direction: values.direction,
         },
-        currentPrice: required.values.currentPrice,
+        currentPrice: values.currentPrice,
       });
-      console.log(
-        JSON.stringify(
-          {
-            command: 'trigger-eval',
-            result,
-          },
-          null,
-          2,
-        ),
-      );
-      return;
+      return { command: 'trigger-eval', result };
     }
     case 'workflow-smoke': {
-      const required = requireStringFlags(parsed.flags, [
+      const values = requireStringFlags(flags, [
         'tokenIn',
         'tokenOut',
         'amount',
         'targetPrice',
         'currentPrice',
       ]);
-      if (!required.ok) {
-        console.error(`Missing required flags: ${required.missing.join(', ')}`);
-        process.exitCode = 1;
-        return;
-      }
-
-      const config = await loadConfig();
-      const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      if (!activeUser) {
-        console.error('Active user not found.');
-        process.exitCode = 1;
-        return;
-      }
-
+      const { activeUser } = await getActiveUserFromConfig();
       const recommendation: Recommendation = {
         id: crypto.randomUUID(),
         createdAt: new Date().toISOString(),
         request: {
           tokenIn: {
             chainId: activeUser.wallet.chainId,
-            symbol: required.values.tokenIn,
+            symbol: values.tokenIn,
             address: '',
             decimals: 18,
           },
           tokenOut: {
             chainId: activeUser.wallet.chainId,
-            symbol: required.values.tokenOut,
+            symbol: values.tokenOut,
             address: '',
             decimals: 18,
           },
-          amountIn: required.values.amount,
+          amountIn: values.amount,
           slippageBps: 100,
         },
         rationale: 'Generated by workflow-smoke',
@@ -625,42 +515,110 @@ async function run(): Promise<void> {
           id: 'smoke-trigger',
           label: 'smoke trigger',
           enabled: true,
-          tokenInSymbol: required.values.tokenIn,
-          tokenOutSymbol: required.values.tokenOut,
-          targetPrice: required.values.targetPrice,
+          tokenInSymbol: values.tokenIn,
+          tokenOutSymbol: values.tokenOut,
+          targetPrice: values.targetPrice,
           direction: 'below',
         },
-        currentPrice: required.values.currentPrice,
+        currentPrice: values.currentPrice,
       });
-
       const policyDecision = evaluateExecutionPolicy({
         mode: activeUser.mode,
         policy: activeUser.policy,
-        tokenInSymbol: required.values.tokenIn,
+        tokenInSymbol: values.tokenIn,
         amountUsd: undefined,
         explicitConfirmation: true,
       });
+      return {
+        command: 'workflow-smoke',
+        mode: activeUser.mode,
+        recommendationId: recommendation.id,
+        triggerResult,
+        policyDecision,
+        memoryPath: getMemoryPath(),
+      };
+    }
+  }
+}
 
-      console.log(
-        JSON.stringify(
-          {
-            command: 'workflow-smoke',
-            mode: activeUser.mode,
-            recommendationId: recommendation.id,
-            triggerResult,
-            policyDecision,
-            memoryPath: getMemoryPath(),
-          },
-          null,
-          2,
-        ),
-      );
+function printChatFriendlyResult(action: CommandName, result: unknown): void {
+  if (action === 'wallet-balance') {
+    const payload = result as {
+      wallet: string;
+      chainId: number;
+      portfolio: {
+        native: { ether: string };
+        tokens: Array<{ symbol: string; balanceFormatted: string; contractAddress: string }>;
+      };
+    };
+    console.log(`Assistant: Wallet ${payload.wallet} on chain ${payload.chainId}`);
+    console.log(`Assistant: Native balance: ${payload.portfolio.native.ether}`);
+    if (payload.portfolio.tokens.length === 0) {
+      console.log('Assistant: No ERC-20 token balances found via Alchemy.');
       return;
     }
-    default: {
-      printHelp();
-      return;
+    console.log('Assistant: Token balances:');
+    for (const token of payload.portfolio.tokens) {
+      console.log(`- ${token.symbol}: ${token.balanceFormatted} (${token.contractAddress})`);
     }
+    return;
+  }
+
+  console.log(`Assistant: ${JSON.stringify(result, null, 2)}`);
+}
+
+async function runChatMode(): Promise<void> {
+  console.log('NonceSense chat mode started. Ask naturally (type "exit" to quit).');
+  const rl = createInterface({ input, output });
+  try {
+    while (true) {
+      const message = (await rl.question('You: ')).trim();
+      if (!message) {
+        continue;
+      }
+      if (message.toLowerCase() === 'exit' || message.toLowerCase() === 'quit') {
+        break;
+      }
+
+      let plan: ActionPlan;
+      try {
+        plan = await planFromUserMessage(message);
+      } catch (error: unknown) {
+        const text = error instanceof Error ? error.message : String(error);
+        console.log(`Assistant: I could not parse that yet (${text}). Try rephrasing.`);
+        continue;
+      }
+
+      if (plan.action === 'none' || !EXECUTABLE_ACTIONS.includes(plan.action)) {
+        console.log(`Assistant: ${plan.reply}`);
+        continue;
+      }
+
+      try {
+        const result = await executeCommand(plan.action, plan.flags);
+        printChatFriendlyResult(plan.action, result);
+      } catch (error: unknown) {
+        const text = error instanceof Error ? error.message : String(error);
+        console.log(`Assistant: ${text}`);
+      }
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+async function run(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0) {
+    await runChatMode();
+    return;
+  }
+
+  const parsed = parseArgv(argv);
+  const command = parsed.command ?? 'help';
+  const result = await executeCommand(command, parsed.flags);
+  if (command !== 'help') {
+    console.log(JSON.stringify(result, null, 2));
   }
 }
 
