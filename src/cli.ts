@@ -370,15 +370,17 @@ function heuristicPlan(message: string): ActionPlan | undefined {
   }
 
   const quote = parseSwapDetailsFromMessage(message);
+  const asksQuote = /\b(quote|price|how much)\b/.test(lower);
+  const asksSwapExecute = /\b(swap|execute|trade)\b/.test(lower) && !asksQuote;
   if (quote.tokenIn && quote.tokenOut && quote.amount) {
     return {
-      action: 'swap-quote',
+      action: asksSwapExecute ? 'swap-execute' : 'swap-quote',
       flags: {
         tokenIn: quote.tokenIn,
         tokenOut: quote.tokenOut,
         amount: quote.amount,
       },
-      reply: 'Getting a swap quote.',
+      reply: asksSwapExecute ? 'Preparing swap execution.' : 'Getting a swap quote.',
     };
   }
 
@@ -394,7 +396,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     };
   }
 
-  if (/\b(quote|swap|price)\b/.test(lower)) {
+  if (asksQuote) {
     return {
       action: 'swap-quote',
       flags: {
@@ -403,6 +405,18 @@ function heuristicPlan(message: string): ActionPlan | undefined {
         ...(quote.amount ? { amount: quote.amount } : {}),
       },
       reply: 'Sure — share token pair and amount if not already provided.',
+    };
+  }
+
+  if (asksSwapExecute) {
+    return {
+      action: 'swap-execute',
+      flags: {
+        ...(quote.tokenIn ? { tokenIn: quote.tokenIn } : {}),
+        ...(quote.tokenOut ? { tokenOut: quote.tokenOut } : {}),
+        ...(quote.amount ? { amount: quote.amount } : {}),
+      },
+      reply: 'Sure — share token pair and amount for execution if not already provided.',
     };
   }
 
@@ -984,9 +998,17 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
       amountOutFormatted: string;
     };
     console.log(
-      `Assistant: Quote — ${payload.amountInFormatted} ${payload.tokenIn.symbol} -> ${payload.amountOutFormatted} ${payload.tokenOut.symbol}`,
+      `Assistant: Uniswap V3 quote — ${payload.amountInFormatted} ${payload.tokenIn.symbol} -> ${payload.amountOutFormatted} ${payload.tokenOut.symbol}`,
     );
     return;
+  }
+
+  if (action === 'swap-execute') {
+    const payload = result as { transactionHash?: string };
+    if (payload.transactionHash) {
+      console.log(`Assistant: Swap submitted on Uniswap. Tx hash: ${payload.transactionHash}`);
+      return;
+    }
   }
 
   console.log(`Assistant: ${JSON.stringify(result, null, 2)}`);
