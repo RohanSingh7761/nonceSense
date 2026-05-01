@@ -1,6 +1,7 @@
 import 'dotenv/config';
 
 import { GoogleGenAI } from '@google/genai';
+import { ethers } from 'ethers';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
@@ -47,21 +48,104 @@ type CommandName =
   | 'workflow-smoke'
   | 'version';
 
-interface ParsedArgs {
-  command?: CommandName;
-  flags: Record<string, string | boolean>;
-}
-
 interface ActionPlan {
   action: CommandName | 'none';
   flags: Record<string, string>;
   reply: string;
 }
 
+interface ActionStep {
+  action: CommandName;
+  flags: Record<string, string>;
+  minNativeBalanceEth?: string;
+  useCurrentNativeBalanceAsAmount?: boolean;
+}
+
+interface TokenMetadata {
+  symbol: string;
+  address: string;
+  decimals: number;
+}
+
 function getNetworkLabel(chainId: number): string {
   if (chainId === 11155111) return 'Sepolia';
   if (chainId === 1) return 'Ethereum Mainnet';
   return `Chain ${chainId}`;
+}
+
+function getTokenDirectory(chainId: number): Record<string, TokenMetadata> {
+  if (chainId === 11155111) {
+    return {
+      ETH: { symbol: 'WETH', address: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14', decimals: 18 },
+      WETH: { symbol: 'WETH', address: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14', decimals: 18 },
+      USDC: { symbol: 'USDC', address: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', decimals: 6 },
+    };
+  }
+
+  if (chainId === 1) {
+    return {
+      ETH: { symbol: 'WETH', address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18 },
+      WETH: { symbol: 'WETH', address: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2', decimals: 18 },
+      USDC: { symbol: 'USDC', address: '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48', decimals: 6 },
+    };
+  }
+
+  return {};
+}
+
+function resolveToken(chainId: number, tokenInput: string, decimalsOverride?: string): TokenMetadata {
+  if (tokenInput.startsWith('0x')) {
+    return {
+      symbol: 'TOKEN',
+      address: tokenInput,
+      decimals: decimalsOverride ? parsePositiveInteger(decimalsOverride, 'token decimals') : 18,
+    };
+  }
+
+  const normalized = tokenInput.toUpperCase();
+  const directory = getTokenDirectory(chainId);
+  const found = directory[normalized];
+  if (!found) {
+    throw new Error(`Unsupported token "${tokenInput}" on ${getNetworkLabel(chainId)}.`);
+  }
+
+  return found;
+}
+
+function parseSwapQuoteFromMessage(message: string): { tokenIn?: string; tokenOut?: string; amount?: string } {
+  const pattern = /(?:swap(?:ping)?|quote(?: for)?(?: swapping)?|price)\s+(?:for\s+)?(\d+(\.\d+)?)\s*([a-zA-Z]+)\s+(?:with|to|for)\s+([a-zA-Z]+)/i;
+  const match = message.match(pattern);
+  if (!match) {
+    return {};
+  }
+  return {
+    amount: match[1],
+    tokenIn: match[3],
+    tokenOut: match[4],
+  };
+}
+
+function parseConditionalBalanceQuote(message: string): { thresholdEth: string; tokenOut: string } | undefined {
+  const lower = message.toLowerCase();
+  if (!lower.includes('balance') || !lower.includes('quote') || !lower.includes('if')) {
+    return undefined;
+  }
+
+  const thresholdMatch = message.match(/more than\s+(\d+(\.\d+)?)\s*eth/i);
+  if (!thresholdMatch) {
+    return undefined;
+  }
+
+  const withMatch = message.match(/with\s+(?:equivalent\s+amt\s+of\s+)?([a-zA-Z]+)/i);
+  const toMatch = message.match(/to\s+([a-zA-Z]+)/i);
+  let tokenOut = (withMatch?.[1] ?? toMatch?.[1] ?? 'USDC').toUpperCase();
+  if (['SWAPPING', 'QUOTE', 'QUOTES', 'EQUIVALENT', 'AMT'].includes(tokenOut)) {
+    tokenOut = 'USDC';
+  }
+  return {
+    thresholdEth: thresholdMatch[1],
+    tokenOut,
+  };
 }
 
 const VALID_MODES: UserMode[] = [
@@ -83,55 +167,6 @@ const EXECUTABLE_ACTIONS: CommandName[] = [
   'trigger-eval',
   'workflow-smoke',
 ];
-
-function parseArgv(argv: string[]): ParsedArgs {
-  const [candidateCommand, ...rest] = argv;
-  const command = isCommand(candidateCommand) ? candidateCommand : undefined;
-  const source = command ? rest : argv;
-  const flags: Record<string, string | boolean> = {};
-
-  for (let index = 0; index < source.length; index += 1) {
-    const token = source[index];
-    if (!token.startsWith('--')) {
-      continue;
-    }
-    const withoutPrefix = token.slice(2);
-    const separatorIndex = withoutPrefix.indexOf('=');
-    if (separatorIndex >= 0) {
-      const key = withoutPrefix.slice(0, separatorIndex);
-      const value = withoutPrefix.slice(separatorIndex + 1);
-      flags[key] = value;
-      continue;
-    }
-    const nextToken = source[index + 1];
-    if (nextToken && !nextToken.startsWith('--')) {
-      flags[withoutPrefix] = nextToken;
-      index += 1;
-      continue;
-    }
-    flags[withoutPrefix] = true;
-  }
-
-  return { command, flags };
-}
-
-function isCommand(value: string | undefined): value is CommandName {
-  return (
-    value === 'help' ||
-    value === 'setup' ||
-    value === 'recommend' ||
-    value === 'execute' ||
-    value === 'mode' ||
-    value === 'wallet-balance' ||
-    value === 'wallet-transfer' ||
-    value === 'swap-quote' ||
-    value === 'swap-execute' ||
-    value === 'recent-recommendations' ||
-    value === 'trigger-eval' ||
-    value === 'workflow-smoke' ||
-    value === 'version'
-  );
-}
 
 function asStringFlag(flags: Record<string, string | boolean>, key: string): string | undefined {
   const value = flags[key];
@@ -178,26 +213,41 @@ function parseNumber(value: string, fieldName: string): number {
   return parsed;
 }
 
+function humanizeMissingDetails(errorText: string): string {
+  const raw = errorText.replace('Missing required details:', '').trim();
+  const parts = raw.split(',').map((item) => item.trim()).filter(Boolean);
+  const mapped = parts.map((item) => {
+    switch (item) {
+      case 'tokenIn':
+        return 'input token (example: ETH)';
+      case 'tokenOut':
+        return 'output token (example: USDC)';
+      case 'amount':
+      case 'amountEth':
+        return 'amount';
+      case 'to':
+        return 'recipient wallet address';
+      case 'mode':
+        return 'mode (recommendation-only / assisted-execution / limited-auto-execution)';
+      default:
+        return item;
+    }
+  });
+  return `I need these details: ${mapped.join(', ')}.`;
+}
+
 function printHelp(): void {
   console.log(`NonceSense CLI
 
 Usage:
-  npm run dev                      # chat mode
+  npm run dev
 
-Commands:
-  help
-  version
-  setup (chat can auto-create wallet)
-  wallet-balance
-  wallet-transfer --to <address> --amountEth <amount>
-  swap-quote --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>]
-  swap-execute --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>] [--slippageBps <number>]
-  recommend --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount>
-  execute --recommendationId <id> [--confirm true] [--amountUsd <number>]
-  recent-recommendations [--limit <number>]
-  trigger-eval --targetPrice <number> --currentPrice <number> --direction <above|below> --tokenIn <symbol> --tokenOut <symbol>
-  workflow-smoke --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount> --targetPrice <number> --currentPrice <number>
-  mode --set <recommendation-only|assisted-execution|limited-auto-execution> (chat can infer)
+Chat examples:
+  "What is my balance?"
+  "Send 0.001 ETH to 0x..."
+  "Give me quote for swapping 0.007 ETH to USDC"
+  "What is my balance, and if above 0.005 ETH then quote ETH to USDC"
+  "Set mode to assisted execution"
 `);
 }
 
@@ -263,6 +313,19 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return { action: 'wallet-balance', flags: {}, reply: 'Checking your balance.' };
   }
 
+  const quote = parseSwapQuoteFromMessage(message);
+  if (quote.tokenIn && quote.tokenOut && quote.amount) {
+    return {
+      action: 'swap-quote',
+      flags: {
+        tokenIn: quote.tokenIn,
+        tokenOut: quote.tokenOut,
+        amount: quote.amount,
+      },
+      reply: 'Getting a swap quote.',
+    };
+  }
+
   if (/\b(send|transfer)\b/.test(lower) && /\beth\b/i.test(message) && /0x[a-fA-F0-9]{40}/.test(message)) {
     const parsed = parseTransferFromMessage(message);
     return {
@@ -296,6 +359,62 @@ async function directNetworkAnswer(message: string): Promise<string | undefined>
   return `You are on ${getNetworkLabel(activeUser.wallet.chainId)} (chain ${activeUser.wallet.chainId}).`;
 }
 
+async function buildActionSteps(message: string): Promise<{ steps: ActionStep[]; reply?: string }> {
+  const conditional = parseConditionalBalanceQuote(message);
+  if (conditional) {
+    return {
+      steps: [
+        { action: 'wallet-balance', flags: {} },
+        {
+          action: 'swap-quote',
+          flags: { tokenIn: 'ETH', tokenOut: conditional.tokenOut },
+          minNativeBalanceEth: conditional.thresholdEth,
+          useCurrentNativeBalanceAsAmount: true,
+        },
+      ],
+    };
+  }
+
+  const subRequests = message
+    .split(/\b(?:and then|then|also| and )\b/i)
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
+
+  if (subRequests.length > 1) {
+    const steps: ActionStep[] = [];
+    for (const request of subRequests) {
+      const heuristicSub = heuristicPlan(request);
+      if (heuristicSub && heuristicSub.action !== 'none') {
+        steps.push({ action: heuristicSub.action, flags: heuristicSub.flags });
+        continue;
+      }
+
+      const plannedSub = await planFromUserMessage(request);
+      if (plannedSub.action !== 'none' && EXECUTABLE_ACTIONS.includes(plannedSub.action)) {
+        steps.push({ action: plannedSub.action, flags: plannedSub.flags });
+      }
+    }
+    if (steps.length > 0) {
+      return { steps };
+    }
+  }
+
+  const heuristic = heuristicPlan(message);
+  if (heuristic && heuristic.action !== 'none') {
+    return {
+      steps: [{ action: heuristic.action, flags: heuristic.flags }],
+    };
+  }
+
+  const planned = await planFromUserMessage(message);
+  if (planned.action === 'none' || !EXECUTABLE_ACTIONS.includes(planned.action)) {
+    return { steps: [], reply: planned.reply };
+  }
+  return {
+    steps: [{ action: planned.action, flags: planned.flags }],
+  };
+}
+
 async function planFromUserMessage(userMessage: string): Promise<ActionPlan> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -308,7 +427,7 @@ async function planFromUserMessage(userMessage: string): Promise<ActionPlan> {
   }
 
   const ai = new GoogleGenAI({ apiKey });
-  const prompt = `You are a router for a crypto CLI. Convert user chat into one command action.
+  const prompt = `You are a router for a chat-first crypto assistant. Convert user chat into one action.
 
 Return STRICT JSON only:
 {
@@ -322,6 +441,8 @@ Rules:
 - For mode changes, use action=mode and flags.set.
 - For setup, user may provide no args. Use action=setup with empty flags to auto-create wallet.
 - If user asks "how/steps" instead of executing, set action=none and explain in reply.
+- For transfers, extract recipient address and ETH amount from natural language.
+- For swap quotes, extract amount + token pair from natural language (example: "0.007 eth with usdc").
 - If required values are missing, keep action as best guess and include missing details in reply.
 - Never invent addresses/private keys.
 - Keep flags string-to-string.
@@ -418,23 +539,93 @@ async function executeCommand(
       };
     }
     case 'swap-quote': {
-      const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amountIn']);
       await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
+      const tokenInInput = asStringFlag(flags, 'tokenIn');
+      const tokenOutInput = asStringFlag(flags, 'tokenOut');
+      if (!tokenInInput || !tokenOutInput) {
+        throw new Error('Missing required details: tokenIn, tokenOut');
+      }
+
+      const tokenIn = resolveToken(
+        activeUser.wallet.chainId,
+        tokenInInput,
+        asStringFlag(flags, 'tokenInDecimals'),
+      );
+      const tokenOut = resolveToken(
+        activeUser.wallet.chainId,
+        tokenOutInput,
+        asStringFlag(flags, 'tokenOutDecimals'),
+      );
+
+      const amountRaw =
+        asStringFlag(flags, 'amountIn') ??
+        (() => {
+          const amountHuman =
+            asStringFlag(flags, 'amount') ??
+            asStringFlag(flags, 'amountEth');
+          if (!amountHuman) {
+            return undefined;
+          }
+          return ethers.parseUnits(amountHuman, tokenIn.decimals).toString();
+        })();
+
+      if (!amountRaw) {
+        throw new Error('Missing required details: amount');
+      }
+
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const quote = await quoteExactInputSingle({
         wallet: activeUser.wallet,
-        tokenIn: values.tokenIn,
-        tokenOut: values.tokenOut,
-        amountIn: values.amountIn,
+        tokenIn: tokenIn.address,
+        tokenOut: tokenOut.address,
+        amountIn: amountRaw,
         fee,
       });
-      return { command: 'swap-quote', quote };
+      return {
+        command: 'swap-quote',
+        tokenIn,
+        tokenOut,
+        amountInRaw: amountRaw,
+        amountInFormatted: ethers.formatUnits(amountRaw, tokenIn.decimals),
+        amountOutRaw: quote.amountOut,
+        amountOutFormatted: ethers.formatUnits(quote.amountOut, tokenOut.decimals),
+      };
     }
     case 'swap-execute': {
-      const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amountIn']);
       await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
+      const tokenInInput = asStringFlag(flags, 'tokenIn');
+      const tokenOutInput = asStringFlag(flags, 'tokenOut');
+      if (!tokenInInput || !tokenOutInput) {
+        throw new Error('Missing required details: tokenIn, tokenOut');
+      }
+      const tokenIn = resolveToken(
+        activeUser.wallet.chainId,
+        tokenInInput,
+        asStringFlag(flags, 'tokenInDecimals'),
+      );
+      const tokenOut = resolveToken(
+        activeUser.wallet.chainId,
+        tokenOutInput,
+        asStringFlag(flags, 'tokenOutDecimals'),
+      );
+
+      const amountRaw =
+        asStringFlag(flags, 'amountIn') ??
+        (() => {
+          const amountHuman =
+            asStringFlag(flags, 'amount') ??
+            asStringFlag(flags, 'amountEth');
+          if (!amountHuman) {
+            return undefined;
+          }
+          return ethers.parseUnits(amountHuman, tokenIn.decimals).toString();
+        })();
+      if (!amountRaw) {
+        throw new Error('Missing required details: amount');
+      }
+
       const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const slippageBps = parsePositiveInteger(
@@ -444,9 +635,9 @@ async function executeCommand(
       const tx = await swapExactInputSingle({
         wallet: activeUser.wallet,
         privateKey,
-        tokenIn: values.tokenIn,
-        tokenOut: values.tokenOut,
-        amountIn: values.amountIn,
+        tokenIn: tokenIn.address,
+        tokenOut: tokenOut.address,
+        amountIn: amountRaw,
         fee,
         slippageBps,
       });
@@ -692,6 +883,19 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
     return;
   }
 
+  if (action === 'swap-quote') {
+    const payload = result as {
+      tokenIn: { symbol: string };
+      tokenOut: { symbol: string };
+      amountInFormatted: string;
+      amountOutFormatted: string;
+    };
+    console.log(
+      `Assistant: Quote — ${payload.amountInFormatted} ${payload.tokenIn.symbol} -> ${payload.amountOutFormatted} ${payload.tokenOut.symbol}`,
+    );
+    return;
+  }
+
   console.log(`Assistant: ${JSON.stringify(result, null, 2)}`);
 }
 
@@ -723,41 +927,62 @@ async function runChatMode(): Promise<void> {
         continue;
       }
 
-      let plan: ActionPlan | undefined = heuristicPlan(message);
-      if (!plan) {
-        try {
-          plan = await planFromUserMessage(message);
-        } catch (error: unknown) {
-          const text = error instanceof Error ? error.message : String(error);
-          console.log(`Assistant: I could not parse that yet (${text}). Try rephrasing.`);
-          continue;
-        }
-      }
-
-      if (plan.action === 'wallet-transfer') {
-        const extracted = parseTransferFromMessage(message);
-        if (!plan.flags.to && extracted.to) {
-          plan.flags.to = extracted.to;
-        }
-        if (!plan.flags.amountEth && extracted.amountEth) {
-          plan.flags.amountEth = extracted.amountEth;
-        }
-      }
-
-      if (plan.action === 'none' || !EXECUTABLE_ACTIONS.includes(plan.action)) {
-        console.log(`Assistant: ${plan.reply}`);
+      let built: { steps: ActionStep[]; reply?: string };
+      try {
+        built = await buildActionSteps(message);
+      } catch (error: unknown) {
+        const text = error instanceof Error ? error.message : String(error);
+        console.log(`Assistant: I could not parse that yet (${text}). Try rephrasing.`);
         continue;
       }
 
-      try {
-        const result = await executeCommand(plan.action, plan.flags);
-        printChatFriendlyResult(plan.action, result);
-      } catch (error: unknown) {
-        const text = error instanceof Error ? error.message : String(error);
-        if (text.startsWith('Missing required details:')) {
-          console.log(`Assistant: ${text.replace('Missing required details:', 'I need these details:')}`);
-        } else {
-          console.log(`Assistant: ${text}`);
+      if (built.steps.length === 0) {
+        console.log(`Assistant: ${built.reply ?? 'Got it.'}`);
+        continue;
+      }
+
+      let currentNativeBalanceEth: string | undefined;
+      for (const step of built.steps) {
+        if (step.action === 'wallet-transfer') {
+          const extracted = parseTransferFromMessage(message);
+          if (!step.flags.to && extracted.to) {
+            step.flags.to = extracted.to;
+          }
+          if (!step.flags.amountEth && extracted.amountEth) {
+            step.flags.amountEth = extracted.amountEth;
+          }
+        }
+
+        if (step.useCurrentNativeBalanceAsAmount && currentNativeBalanceEth) {
+          step.flags.amount = currentNativeBalanceEth;
+        }
+
+        if (step.minNativeBalanceEth && currentNativeBalanceEth) {
+          const current = Number(currentNativeBalanceEth);
+          const threshold = Number(step.minNativeBalanceEth);
+          if (Number.isFinite(current) && Number.isFinite(threshold) && current <= threshold) {
+            console.log(
+              `Assistant: Skipping quote because balance ${currentNativeBalanceEth} ETH is not above ${step.minNativeBalanceEth} ETH.`,
+            );
+            continue;
+          }
+        }
+
+        try {
+          const result = await executeCommand(step.action, step.flags);
+          printChatFriendlyResult(step.action, result);
+
+          if (step.action === 'wallet-balance') {
+            const payload = result as { portfolio: { native: { ether: string } } };
+            currentNativeBalanceEth = payload.portfolio.native.ether;
+          }
+        } catch (error: unknown) {
+          const text = error instanceof Error ? error.message : String(error);
+          if (text.startsWith('Missing required details:')) {
+            console.log(`Assistant: ${humanizeMissingDetails(text)}`);
+          } else {
+            console.log(`Assistant: ${text}`);
+          }
         }
       }
     }
@@ -767,18 +992,7 @@ async function runChatMode(): Promise<void> {
 }
 
 async function run(): Promise<void> {
-  const argv = process.argv.slice(2);
-  if (argv.length === 0) {
-    await runChatMode();
-    return;
-  }
-
-  const parsed = parseArgv(argv);
-  const command = parsed.command ?? 'help';
-  const result = await executeCommand(command, parsed.flags);
-  if (command !== 'help') {
-    console.log(JSON.stringify(result, null, 2));
-  }
+  await runChatMode();
 }
 
 run().catch((error: unknown) => {
