@@ -1,12 +1,18 @@
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
+import { ethers } from 'ethers';
 
 import type { AppConfig, UserMode } from '../types/index.js';
 
 const CONFIG_DIRECTORY = path.join(process.cwd(), '.noncesense');
 const CONFIG_FILE_PATH = path.join(CONFIG_DIRECTORY, 'config.json');
+const SECRETS_FILE_PATH = path.join(CONFIG_DIRECTORY, 'secrets.json');
 const DEFAULT_USER_ID = 'default-user';
+
+interface SecretsStore {
+  userPrivateKeys: Record<string, string>;
+}
 
 function getDefaultConfig(): AppConfig {
   return {
@@ -56,6 +62,32 @@ export async function saveConfig(config: AppConfig): Promise<void> {
   await writeFile(CONFIG_FILE_PATH, JSON.stringify(config, null, 2), 'utf8');
 }
 
+function getDefaultSecrets(): SecretsStore {
+  return {
+    userPrivateKeys: {},
+  };
+}
+
+async function ensureSecretsExists(): Promise<void> {
+  await mkdir(CONFIG_DIRECTORY, { recursive: true });
+  try {
+    await access(SECRETS_FILE_PATH, fsConstants.F_OK);
+  } catch {
+    await writeFile(SECRETS_FILE_PATH, JSON.stringify(getDefaultSecrets(), null, 2), 'utf8');
+  }
+}
+
+async function loadSecrets(): Promise<SecretsStore> {
+  await ensureSecretsExists();
+  const raw = await readFile(SECRETS_FILE_PATH, 'utf8');
+  return JSON.parse(raw) as SecretsStore;
+}
+
+async function saveSecrets(secrets: SecretsStore): Promise<void> {
+  await mkdir(CONFIG_DIRECTORY, { recursive: true });
+  await writeFile(SECRETS_FILE_PATH, JSON.stringify(secrets, null, 2), 'utf8');
+}
+
 function getOrCreateActiveUser(config: AppConfig): AppConfig['users'][number] {
   const active = config.users.find((user) => user.id === config.activeUserId);
   if (active) {
@@ -83,6 +115,49 @@ export async function setActiveUserMode(mode: UserMode): Promise<AppConfig> {
   activeUser.mode = mode;
   await saveConfig(config);
   return config;
+}
+
+export interface WalletInitializationResult {
+  config: AppConfig;
+  created: boolean;
+  privateKey?: string;
+}
+
+export async function ensureActiveUserWallet(defaultRpcUrl: string, defaultChainId = 11155111): Promise<WalletInitializationResult> {
+  const config = await loadConfig();
+  const secrets = await loadSecrets();
+  const activeUser = getOrCreateActiveUser(config);
+  const savedKey = secrets.userPrivateKeys[activeUser.id];
+
+  if (activeUser.wallet.address && activeUser.wallet.rpcUrl) {
+    return {
+      config,
+      created: false,
+      privateKey: savedKey,
+    };
+  }
+
+  const wallet = ethers.Wallet.createRandom();
+  activeUser.wallet.address = wallet.address;
+  activeUser.wallet.rpcUrl = defaultRpcUrl;
+  activeUser.wallet.chainId = defaultChainId;
+  secrets.userPrivateKeys[activeUser.id] = wallet.privateKey;
+
+  await saveConfig(config);
+  await saveSecrets(secrets);
+
+  return {
+    config,
+    created: true,
+    privateKey: wallet.privateKey,
+  };
+}
+
+export async function getActiveUserPrivateKey(): Promise<string | undefined> {
+  const config = await loadConfig();
+  const secrets = await loadSecrets();
+  const activeUser = getOrCreateActiveUser(config);
+  return secrets.userPrivateKeys[activeUser.id];
 }
 
 export function getConfigPath(): string {

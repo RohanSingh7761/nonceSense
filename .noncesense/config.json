@@ -1,0 +1,25 @@
+{
+  "activeUserId": "default-user",
+  "users": [
+    {
+      "id": "default-user",
+      "label": "Default User",
+      "mode": "recommendation-only",
+      "wallet": {
+        "address": "",
+        "rpcUrl": "",
+        "chainId": 1
+      },
+      "policy": {
+        "maxSingleSwapUsd": 1000,
+        "maxDailySwapUsd": 2500,
+        "blockedTokens": [],
+        "allowedProtocols": [
+          "uniswap"
+        ],
+        "requireUserConfirmationAboveUsd": 100
+      }
+    }
+  ],
+  "triggers": []
+}

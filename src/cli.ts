@@ -4,7 +4,14 @@ import { GoogleGenAI } from '@google/genai';
 import { createInterface } from 'node:readline/promises';
 import { stdin as input, stdout as output } from 'node:process';
 
-import { getConfigPath, loadConfig, setActiveUserMode, setActiveUserWallet } from './config/store.js';
+import {
+  ensureActiveUserWallet,
+  getActiveUserPrivateKey,
+  getConfigPath,
+  loadConfig,
+  setActiveUserMode,
+  setActiveUserWallet,
+} from './config/store.js';
 import {
   getNativeBalance,
   getWalletPortfolio,
@@ -134,13 +141,13 @@ function requireStringFlags(
   for (const key of keys) {
     const value = asStringFlag(flags, key);
     if (!value) {
-      missing.push(`--${key}`);
+      missing.push(key);
       continue;
     }
     values[key] = value;
   }
   if (missing.length > 0) {
-    throw new Error(`Missing required flags: ${missing.join(', ')}`);
+    throw new Error(`Missing required details: ${missing.join(', ')}`);
   }
   return values;
 }
@@ -170,12 +177,11 @@ function printHelp(): void {
 
 Usage:
   npm run dev                      # chat mode
-  npm run dev -- <command> [--flags]
 
 Commands:
   help
   version
-  setup --wallet <address> [--rpc <url>] [--chainId <number>]
+  setup (chat can auto-create wallet)
   wallet-balance
   wallet-transfer --to <address> --amountEth <amount>
   swap-quote --tokenIn <address> --tokenOut <address> --amountIn <raw> [--fee <500|3000|10000>]
@@ -185,7 +191,7 @@ Commands:
   recent-recommendations [--limit <number>]
   trigger-eval --targetPrice <number> --currentPrice <number> --direction <above|below> --tokenIn <symbol> --tokenOut <symbol>
   workflow-smoke --tokenIn <symbol> --tokenOut <symbol> --amount <rawAmount> --targetPrice <number> --currentPrice <number>
-  mode --set <recommendation-only|assisted-execution|limited-auto-execution>
+  mode --set <recommendation-only|assisted-execution|limited-auto-execution> (chat can infer)
 `);
 }
 
@@ -196,6 +202,30 @@ async function getActiveUserFromConfig() {
     throw new Error('Active user not found.');
   }
   return { config, activeUser };
+}
+
+function getDefaultRpcUrl(): string {
+  return process.env.ALCHEMY_SEPOLIA_ENDPOINT ?? '';
+}
+
+async function ensureWalletReady(): Promise<{
+  created: boolean;
+  walletAddress: string;
+  chainId: number;
+  privateKey?: string;
+}> {
+  const chainId = 11155111;
+  const walletInit = await ensureActiveUserWallet(getDefaultRpcUrl(), chainId);
+  const activeUser = walletInit.config.users.find((user) => user.id === walletInit.config.activeUserId);
+  if (!activeUser) {
+    throw new Error('Active user not found.');
+  }
+  return {
+    created: walletInit.created,
+    walletAddress: activeUser.wallet.address,
+    chainId: activeUser.wallet.chainId,
+    privateKey: walletInit.privateKey,
+  };
 }
 
 function extractJsonObject(text: string): string {
@@ -235,7 +265,8 @@ Return STRICT JSON only:
 Rules:
 - Prefer wallet-balance for balance queries.
 - For mode changes, use action=mode and flags.set.
-- For setup, infer rpc from ALCHEMY_SEPOLIA_ENDPOINT if user asks for sepolia and no rpc specified.
+- For setup, user may provide no args. Use action=setup with empty flags to auto-create wallet.
+- If user asks "how/steps" instead of executing, set action=none and explain in reply.
 - If required values are missing, keep action as best guess and include missing details in reply.
 - Never invent addresses/private keys.
 - Keep flags string-to-string.
@@ -270,25 +301,32 @@ async function executeCommand(
     case 'setup': {
       const wallet = asStringFlag(flags, 'wallet');
       if (!wallet) {
-        throw new Error('Missing required flag: --wallet');
+        const initialized = await ensureWalletReady();
+        return {
+          command: 'setup',
+          saved: true,
+          configPath: getConfigPath(),
+          autoCreated: initialized.created,
+          walletAddress: initialized.walletAddress,
+          chainId: initialized.chainId,
+          privateKey: initialized.privateKey,
+          note: 'Private key is shown once here and stored locally in .noncesense/secrets.json',
+        };
       }
-      const rpc =
-        asStringFlag(flags, 'rpc') ??
-        process.env.ALCHEMY_SEPOLIA_ENDPOINT ??
-        '';
+      const rpc = asStringFlag(flags, 'rpc') ?? getDefaultRpcUrl();
       if (!rpc) {
-        throw new Error('Missing RPC URL. Provide --rpc or set ALCHEMY_SEPOLIA_ENDPOINT.');
+        throw new Error('RPC URL is missing. Add ALCHEMY_SEPOLIA_ENDPOINT in .env.');
       }
       const chainIdRaw = asStringFlag(flags, 'chainId') ?? '11155111';
       const chainId = parsePositiveInteger(chainIdRaw, 'chainId');
       const config = await setActiveUserWallet(wallet, rpc, chainId);
       const activeUser = config.users.find((user) => user.id === config.activeUserId);
-      return { command: 'setup', saved: true, configPath: getConfigPath(), activeUser };
+      return { command: 'setup', saved: true, configPath: getConfigPath(), activeUser, autoCreated: false };
     }
     case 'mode': {
       const mode = asStringFlag(flags, 'set');
       if (!mode) {
-        throw new Error('Missing required flag: --set');
+        throw new Error('Missing required details: mode');
       }
       if (!VALID_MODES.includes(mode as UserMode)) {
         throw new Error(`Invalid mode: ${mode}`);
@@ -298,6 +336,7 @@ async function executeCommand(
       return { command: 'mode', saved: true, configPath: getConfigPath(), mode: activeUser?.mode };
     }
     case 'wallet-balance': {
+      await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
       const nativeBalance = await getNativeBalance(activeUser.wallet);
       const portfolio = await getWalletPortfolio(activeUser.wallet);
@@ -311,8 +350,9 @@ async function executeCommand(
     }
     case 'wallet-transfer': {
       const values = requireStringFlags(flags, ['to', 'amountEth']);
+      await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
-      const privateKey = process.env.PRIVATE_KEY ?? '';
+      const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const tx = await transferNative(activeUser.wallet, privateKey, values.to, values.amountEth);
       return {
         command: 'wallet-transfer',
@@ -324,6 +364,7 @@ async function executeCommand(
     }
     case 'swap-quote': {
       const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amountIn']);
+      await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const quote = await quoteExactInputSingle({
@@ -337,8 +378,9 @@ async function executeCommand(
     }
     case 'swap-execute': {
       const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amountIn']);
+      await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
-      const privateKey = process.env.PRIVATE_KEY ?? '';
+      const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const slippageBps = parsePositiveInteger(
         asStringFlag(flags, 'slippageBps') ?? '100',
@@ -357,6 +399,7 @@ async function executeCommand(
     }
     case 'recommend': {
       const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amount']);
+      await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
       const recommendation: Recommendation = {
         id: crypto.randomUUID(),
@@ -421,7 +464,7 @@ async function executeCommand(
         throw new Error(message);
       }
 
-      const privateKey = process.env.PRIVATE_KEY ?? '';
+      const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const slippageBps = parsePositiveInteger(
         asStringFlag(flags, 'slippageBps') ?? `${recommendation.request.slippageBps}`,
@@ -483,6 +526,7 @@ async function executeCommand(
         'targetPrice',
         'currentPrice',
       ]);
+      await ensureWalletReady();
       const { activeUser } = await getActiveUserFromConfig();
       const recommendation: Recommendation = {
         id: crypto.randomUUID(),
@@ -542,6 +586,35 @@ async function executeCommand(
 }
 
 function printChatFriendlyResult(action: CommandName, result: unknown): void {
+  if (action === 'setup') {
+    const payload = result as {
+      walletAddress: string;
+      chainId: number;
+      privateKey?: string;
+      autoCreated?: boolean;
+      note?: string;
+    };
+    if (payload.autoCreated) {
+      console.log('Assistant: I created your wallet.');
+      console.log(`Assistant: Address: ${payload.walletAddress}`);
+      if (payload.privateKey) {
+        console.log(`Assistant: Private key: ${payload.privateKey}`);
+      }
+      if (payload.note) {
+        console.log(`Assistant: ${payload.note}`);
+      }
+      return;
+    }
+    console.log('Assistant: Wallet setup updated.');
+    return;
+  }
+
+  if (action === 'mode') {
+    const payload = result as { mode?: string };
+    console.log(`Assistant: Mode set to ${payload.mode ?? 'unknown'}.`);
+    return;
+  }
+
   if (action === 'wallet-balance') {
     const payload = result as {
       wallet: string;
@@ -569,6 +642,15 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
 
 async function runChatMode(): Promise<void> {
   console.log('NonceSense chat mode started. Ask naturally (type "exit" to quit).');
+  const initialized = await ensureWalletReady();
+  if (initialized.created) {
+    console.log('Assistant: I created a new wallet for you (first-time setup).');
+    console.log(`Assistant: Address: ${initialized.walletAddress}`);
+    if (initialized.privateKey) {
+      console.log(`Assistant: Private key: ${initialized.privateKey}`);
+      console.log('Assistant: Save this private key securely. It is stored locally for chat execution.');
+    }
+  }
   const rl = createInterface({ input, output });
   try {
     while (true) {
@@ -599,7 +681,11 @@ async function runChatMode(): Promise<void> {
         printChatFriendlyResult(plan.action, result);
       } catch (error: unknown) {
         const text = error instanceof Error ? error.message : String(error);
-        console.log(`Assistant: ${text}`);
+        if (text.startsWith('Missing required details:')) {
+          console.log(`Assistant: ${text.replace('Missing required details:', 'I need these details:')}`);
+        } else {
+          console.log(`Assistant: ${text}`);
+        }
       }
     }
   } finally {
