@@ -36,6 +36,7 @@ export interface UniswapQuoteResult {
 export interface UniswapSwapInput extends UniswapQuoteInput {
   privateKey: string;
   slippageBps: number;
+  useNativeIn?: boolean;
 }
 
 export interface UniswapSwapResult {
@@ -132,7 +133,7 @@ export async function swapExactInputSingle(input: UniswapSwapInput): Promise<Uni
   const amountOutMinimum = (quoteOut * (10_000n - slippage)) / 10_000n;
 
   const contract = new ethers.Contract(router, SWAP_ROUTER_ABI, signer);
-  const tx = await contract.exactInputSingle({
+  const params = {
     tokenIn: input.tokenIn,
     tokenOut: input.tokenOut,
     fee: input.fee,
@@ -141,7 +142,11 @@ export async function swapExactInputSingle(input: UniswapSwapInput): Promise<Uni
     amountIn: BigInt(input.amountIn),
     amountOutMinimum,
     sqrtPriceLimitX96: 0,
-  });
+  };
+
+  const tx = input.useNativeIn
+    ? await contract.exactInputSingle(params, { value: BigInt(input.amountIn) })
+    : await contract.exactInputSingle(params);
 
   return { transactionHash: tx.hash as string };
 }

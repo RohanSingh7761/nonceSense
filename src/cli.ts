@@ -463,6 +463,9 @@ function explainError(errorText: string): string {
   if (errorText.includes('Missing required details:')) {
     return humanizeMissingDetails(errorText);
   }
+  if (errorText.includes('estimateGas') && errorText.includes('CALL_EXCEPTION')) {
+    return 'It means swap simulation failed before submission. Common reasons: insufficient ETH for amount+gas, no available route/liquidity at chosen fee tier, or token transfer constraints.';
+  }
   return `It means the operation failed with: ${errorText}`;
 }
 
@@ -747,6 +750,7 @@ async function executeCommand(
         amountIn: amountRaw,
         fee,
         slippageBps,
+        useNativeIn: tokenInInput.toUpperCase() === 'ETH',
       });
       return { command: 'swap-execute', transactionHash: tx.transactionHash };
     }
