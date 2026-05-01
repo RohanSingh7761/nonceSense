@@ -58,6 +58,12 @@ interface ActionPlan {
   reply: string;
 }
 
+function getNetworkLabel(chainId: number): string {
+  if (chainId === 11155111) return 'Sepolia';
+  if (chainId === 1) return 'Ethereum Mainnet';
+  return `Chain ${chainId}`;
+}
+
 const VALID_MODES: UserMode[] = [
   'recommendation-only',
   'assisted-execution',
@@ -239,6 +245,55 @@ function extractJsonObject(text: string): string {
     return text.slice(start, end + 1);
   }
   throw new Error('No JSON object found in model response.');
+}
+
+function parseTransferFromMessage(message: string): { to?: string; amountEth?: string } {
+  const addressMatch = message.match(/0x[a-fA-F0-9]{40}/);
+  const amountMatch = message.match(/(\d+(\.\d+)?)\s*eth\b/i);
+  return {
+    to: addressMatch?.[0],
+    amountEth: amountMatch?.[1],
+  };
+}
+
+function heuristicPlan(message: string): ActionPlan | undefined {
+  const lower = message.toLowerCase();
+
+  if (/\b(balance|portfolio|funds)\b/.test(lower)) {
+    return { action: 'wallet-balance', flags: {}, reply: 'Checking your balance.' };
+  }
+
+  if (/\b(send|transfer)\b/.test(lower) && /\beth\b/i.test(message) && /0x[a-fA-F0-9]{40}/.test(message)) {
+    const parsed = parseTransferFromMessage(message);
+    return {
+      action: 'wallet-transfer',
+      flags: {
+        ...(parsed.to ? { to: parsed.to } : {}),
+        ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
+      },
+      reply: 'Preparing transfer.',
+    };
+  }
+
+  return undefined;
+}
+
+async function directNetworkAnswer(message: string): Promise<string | undefined> {
+  const lower = message.toLowerCase();
+  const asksNetwork =
+    lower.includes('mainnet') ||
+    lower.includes('sepolia') ||
+    lower.includes('which network') ||
+    lower.includes('what network') ||
+    lower.includes('is this mainnet');
+
+  if (!asksNetwork) {
+    return undefined;
+  }
+
+  await ensureWalletReady();
+  const { activeUser } = await getActiveUserFromConfig();
+  return `You are on ${getNetworkLabel(activeUser.wallet.chainId)} (chain ${activeUser.wallet.chainId}).`;
 }
 
 async function planFromUserMessage(userMessage: string): Promise<ActionPlan> {
@@ -624,7 +679,7 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
         tokens: Array<{ symbol: string; balanceFormatted: string; contractAddress: string }>;
       };
     };
-    console.log(`Assistant: Wallet ${payload.wallet} on chain ${payload.chainId}`);
+    console.log(`Assistant: Wallet ${payload.wallet} on ${getNetworkLabel(payload.chainId)} (chain ${payload.chainId})`);
     console.log(`Assistant: Native balance: ${payload.portfolio.native.ether}`);
     if (payload.portfolio.tokens.length === 0) {
       console.log('Assistant: No ERC-20 token balances found via Alchemy.');
@@ -662,13 +717,31 @@ async function runChatMode(): Promise<void> {
         break;
       }
 
-      let plan: ActionPlan;
-      try {
-        plan = await planFromUserMessage(message);
-      } catch (error: unknown) {
-        const text = error instanceof Error ? error.message : String(error);
-        console.log(`Assistant: I could not parse that yet (${text}). Try rephrasing.`);
+      const directAnswer = await directNetworkAnswer(message);
+      if (directAnswer) {
+        console.log(`Assistant: ${directAnswer}`);
         continue;
+      }
+
+      let plan: ActionPlan | undefined = heuristicPlan(message);
+      if (!plan) {
+        try {
+          plan = await planFromUserMessage(message);
+        } catch (error: unknown) {
+          const text = error instanceof Error ? error.message : String(error);
+          console.log(`Assistant: I could not parse that yet (${text}). Try rephrasing.`);
+          continue;
+        }
+      }
+
+      if (plan.action === 'wallet-transfer') {
+        const extracted = parseTransferFromMessage(message);
+        if (!plan.flags.to && extracted.to) {
+          plan.flags.to = extracted.to;
+        }
+        if (!plan.flags.amountEth && extracted.amountEth) {
+          plan.flags.amountEth = extracted.amountEth;
+        }
       }
 
       if (plan.action === 'none' || !EXECUTABLE_ACTIONS.includes(plan.action)) {

@@ -6,9 +6,9 @@
       "label": "Default User",
       "mode": "recommendation-only",
       "wallet": {
-        "address": "",
-        "rpcUrl": "",
-        "chainId": 1
+        "address": "0x99DE72cD3718BB8B581C1c0F1AD3Cc27C753FfE1",
+        "rpcUrl": "https://eth-sepolia.g.alchemy.com/v2/JHn0j_5TaODxIe1J1EKCVP3MYifcZAAB",
+        "chainId": 11155111
       },
       "policy": {
         "maxSingleSwapUsd": 1000,
