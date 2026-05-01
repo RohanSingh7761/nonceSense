@@ -112,19 +112,6 @@ function resolveToken(chainId: number, tokenInput: string, decimalsOverride?: st
   return found;
 }
 
-function parseSwapQuoteFromMessage(message: string): { tokenIn?: string; tokenOut?: string; amount?: string } {
-  const pattern = /(?:swap(?:ping)?|quote(?: for)?(?: swapping)?|price)\s+(?:for\s+)?(\d+(\.\d+)?)\s*([a-zA-Z]+)\s+(?:with|to|for)\s+([a-zA-Z]+)/i;
-  const match = message.match(pattern);
-  if (!match) {
-    return {};
-  }
-  return {
-    amount: match[1],
-    tokenIn: match[3],
-    tokenOut: match[4],
-  };
-}
-
 function parseConditionalBalanceQuote(message: string): { thresholdEth: string; tokenOut: string } | undefined {
   const lower = message.toLowerCase();
   if (!lower.includes('balance') || !lower.includes('quote') || !lower.includes('if')) {
@@ -306,6 +293,75 @@ function parseTransferFromMessage(message: string): { to?: string; amountEth?: s
   };
 }
 
+function parseSwapDetailsFromMessage(message: string): { tokenIn?: string; tokenOut?: string; amount?: string } {
+  const compactPattern = /(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s*(?:to|for|with|into)\s*([a-zA-Z]{2,12})/i;
+  const compactMatch = message.match(compactPattern);
+  if (compactMatch) {
+    return {
+      amount: compactMatch[1],
+      tokenIn: compactMatch[3],
+      tokenOut: compactMatch[4],
+    };
+  }
+
+  const verbosePattern =
+    /(?:swap(?:ping)?|quote(?: for)?(?: swapping)?|price)\s+(?:for\s+)?(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s+(?:with|to|for)\s+([a-zA-Z]{2,12})/i;
+  const verboseMatch = message.match(verbosePattern);
+  if (verboseMatch) {
+    return {
+      amount: verboseMatch[1],
+      tokenIn: verboseMatch[3],
+      tokenOut: verboseMatch[4],
+    };
+  }
+
+  return {};
+}
+
+function missingDetailsForStep(step: ActionStep): string[] {
+  if (step.action === 'wallet-transfer') {
+    return ['to', 'amountEth'].filter((key) => !step.flags[key]);
+  }
+  if (step.action === 'swap-quote' || step.action === 'swap-execute') {
+    const missing: string[] = [];
+    if (!step.flags.tokenIn) missing.push('tokenIn');
+    if (!step.flags.tokenOut) missing.push('tokenOut');
+    if (!step.flags.amount && !step.flags.amountIn && !step.flags.amountEth) missing.push('amount');
+    return missing;
+  }
+  if (step.action === 'mode') {
+    return step.flags.set ? [] : ['mode'];
+  }
+  return [];
+}
+
+function enrichPendingStepFromMessage(step: ActionStep, message: string): ActionStep {
+  const enriched: ActionStep = { ...step, flags: { ...step.flags } };
+  if (step.action === 'wallet-transfer') {
+    const extracted = parseTransferFromMessage(message);
+    if (!enriched.flags.to && extracted.to) enriched.flags.to = extracted.to;
+    if (!enriched.flags.amountEth && extracted.amountEth) enriched.flags.amountEth = extracted.amountEth;
+    return enriched;
+  }
+
+  if (step.action === 'swap-quote' || step.action === 'swap-execute') {
+    const extracted = parseSwapDetailsFromMessage(message);
+    if (!enriched.flags.tokenIn && extracted.tokenIn) enriched.flags.tokenIn = extracted.tokenIn;
+    if (!enriched.flags.tokenOut && extracted.tokenOut) enriched.flags.tokenOut = extracted.tokenOut;
+    if (!enriched.flags.amount && extracted.amount) enriched.flags.amount = extracted.amount;
+    return enriched;
+  }
+
+  if (step.action === 'mode') {
+    const lower = message.toLowerCase();
+    if (lower.includes('assisted')) enriched.flags.set = 'assisted-execution';
+    if (lower.includes('recommendation')) enriched.flags.set = 'recommendation-only';
+    if (lower.includes('auto')) enriched.flags.set = 'limited-auto-execution';
+  }
+
+  return enriched;
+}
+
 function heuristicPlan(message: string): ActionPlan | undefined {
   const lower = message.toLowerCase();
 
@@ -313,7 +369,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return { action: 'wallet-balance', flags: {}, reply: 'Checking your balance.' };
   }
 
-  const quote = parseSwapQuoteFromMessage(message);
+  const quote = parseSwapDetailsFromMessage(message);
   if (quote.tokenIn && quote.tokenOut && quote.amount) {
     return {
       action: 'swap-quote',
@@ -335,6 +391,18 @@ function heuristicPlan(message: string): ActionPlan | undefined {
         ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
       },
       reply: 'Preparing transfer.',
+    };
+  }
+
+  if (/\b(quote|swap|price)\b/.test(lower)) {
+    return {
+      action: 'swap-quote',
+      flags: {
+        ...(quote.tokenIn ? { tokenIn: quote.tokenIn } : {}),
+        ...(quote.tokenOut ? { tokenOut: quote.tokenOut } : {}),
+        ...(quote.amount ? { amount: quote.amount } : {}),
+      },
+      reply: 'Sure — share token pair and amount if not already provided.',
     };
   }
 
@@ -937,6 +1005,7 @@ async function runChatMode(): Promise<void> {
   }
   const rl = createInterface({ input, output });
   let lastErrorText: string | undefined;
+  let pendingStep: ActionStep | undefined;
   try {
     while (true) {
       const message = (await rl.question('You: ')).trim();
@@ -950,6 +1019,31 @@ async function runChatMode(): Promise<void> {
       if (shouldExplainLastError(message) && lastErrorText) {
         console.log(`Assistant: ${explainError(lastErrorText)}`);
         continue;
+      }
+
+      if (pendingStep) {
+        const enriched = enrichPendingStepFromMessage(pendingStep, message);
+        const missing = missingDetailsForStep(enriched);
+        if (missing.length === 0) {
+          try {
+            const result = await executeCommand(enriched.action, enriched.flags);
+            lastErrorText = undefined;
+            pendingStep = undefined;
+            printChatFriendlyResult(enriched.action, result);
+            continue;
+          } catch (error: unknown) {
+            const text = error instanceof Error ? error.message : String(error);
+            lastErrorText = text;
+            pendingStep = undefined;
+            if (text.startsWith('Missing required details:')) {
+              console.log(`Assistant: ${humanizeMissingDetails(text)}`);
+            } else {
+              console.log(`Assistant: ${text}`);
+            }
+            continue;
+          }
+        }
+        pendingStep = enriched;
       }
 
       const directAnswer = await directNetworkAnswer(message);
@@ -1002,6 +1096,7 @@ async function runChatMode(): Promise<void> {
         try {
           const result = await executeCommand(step.action, step.flags);
           lastErrorText = undefined;
+          pendingStep = undefined;
           printChatFriendlyResult(step.action, result);
 
           if (step.action === 'wallet-balance') {
@@ -1012,8 +1107,10 @@ async function runChatMode(): Promise<void> {
           const text = error instanceof Error ? error.message : String(error);
           lastErrorText = text;
           if (text.startsWith('Missing required details:')) {
+            pendingStep = step;
             console.log(`Assistant: ${humanizeMissingDetails(text)}`);
           } else {
+            pendingStep = undefined;
             console.log(`Assistant: ${text}`);
           }
         }
