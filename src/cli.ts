@@ -359,6 +359,31 @@ async function directNetworkAnswer(message: string): Promise<string | undefined>
   return `You are on ${getNetworkLabel(activeUser.wallet.chainId)} (chain ${activeUser.wallet.chainId}).`;
 }
 
+function shouldExplainLastError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    (lower.includes('what does this error mean') ||
+      lower.includes('explain this error') ||
+      lower.includes('why this error') ||
+      lower.includes('why did this fail') ||
+      lower.includes('what is this error')) &&
+    lower.includes('error')
+  );
+}
+
+function explainError(errorText: string): string {
+  if (errorText.includes('No Uniswap V3 pool found')) {
+    return 'It means there is no available Uniswap V3 pool for that token pair at the selected fee tier on this network.';
+  }
+  if (errorText.includes('could not decode result data') || errorText.includes('BAD_DATA')) {
+    return 'It means the quote contract call returned empty/invalid data. Common causes are wrong contract address for this network, missing pool for that fee tier, or RPC inconsistency.';
+  }
+  if (errorText.includes('Missing required details:')) {
+    return humanizeMissingDetails(errorText);
+  }
+  return `It means the operation failed with: ${errorText}`;
+}
+
 async function buildActionSteps(message: string): Promise<{ steps: ActionStep[]; reply?: string }> {
   const conditional = parseConditionalBalanceQuote(message);
   if (conditional) {
@@ -911,6 +936,7 @@ async function runChatMode(): Promise<void> {
     }
   }
   const rl = createInterface({ input, output });
+  let lastErrorText: string | undefined;
   try {
     while (true) {
       const message = (await rl.question('You: ')).trim();
@@ -919,6 +945,11 @@ async function runChatMode(): Promise<void> {
       }
       if (message.toLowerCase() === 'exit' || message.toLowerCase() === 'quit') {
         break;
+      }
+
+      if (shouldExplainLastError(message) && lastErrorText) {
+        console.log(`Assistant: ${explainError(lastErrorText)}`);
+        continue;
       }
 
       const directAnswer = await directNetworkAnswer(message);
@@ -970,6 +1001,7 @@ async function runChatMode(): Promise<void> {
 
         try {
           const result = await executeCommand(step.action, step.flags);
+          lastErrorText = undefined;
           printChatFriendlyResult(step.action, result);
 
           if (step.action === 'wallet-balance') {
@@ -978,6 +1010,7 @@ async function runChatMode(): Promise<void> {
           }
         } catch (error: unknown) {
           const text = error instanceof Error ? error.message : String(error);
+          lastErrorText = text;
           if (text.startsWith('Missing required details:')) {
             console.log(`Assistant: ${humanizeMissingDetails(text)}`);
           } else {

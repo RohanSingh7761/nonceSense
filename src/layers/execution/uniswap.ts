@@ -10,8 +10,16 @@ const SWAP_ROUTER_ABI = [
   'function exactInputSingle(tuple(address tokenIn,address tokenOut,uint24 fee,address recipient,uint256 deadline,uint256 amountIn,uint256 amountOutMinimum,uint160 sqrtPriceLimitX96)) external payable returns (uint256 amountOut)',
 ];
 
+const FACTORY_ABI = [
+  'function getPool(address tokenA,address tokenB,uint24 fee) external view returns (address)',
+];
+
 const DEFAULT_ROUTER = '0xE592427A0AEce92De3Edee1F18E0157C05861564';
 const DEFAULT_QUOTER = '0x61fFE014bA17989E743c5F6cB21bF9697530B21e';
+const SEPOLIA_ROUTER = '0x3bFA4769FB09eefC5a80d6E87c3B9C650f7Ae48E';
+const SEPOLIA_QUOTER = '0xEd1f6473345F45b75F8179591dd5bA1888cf2FB3';
+const MAINNET_FACTORY = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
+const SEPOLIA_FACTORY = '0x0227628f3F023bb0B980b67D528571c95c6DaC1c';
 
 export interface UniswapQuoteInput {
   wallet: WalletConfig;
@@ -41,27 +49,69 @@ function getProvider(rpcUrl: string): ethers.JsonRpcProvider {
   return new ethers.JsonRpcProvider(rpcUrl);
 }
 
-function resolveAddresses(): { quoter: string; router: string } {
+function resolveAddresses(chainId: number): { quoter: string; router: string; factory: string } {
+  const defaultByChain =
+    chainId === 11155111
+      ? {
+          quoter: SEPOLIA_QUOTER,
+          router: SEPOLIA_ROUTER,
+          factory: SEPOLIA_FACTORY,
+        }
+      : {
+          quoter: DEFAULT_QUOTER,
+          router: DEFAULT_ROUTER,
+          factory: MAINNET_FACTORY,
+        };
+
   return {
-    quoter: process.env.UNISWAP_QUOTER_V2_ADDRESS ?? DEFAULT_QUOTER,
-    router: process.env.UNISWAP_SWAP_ROUTER_ADDRESS ?? DEFAULT_ROUTER,
+    quoter: process.env.UNISWAP_QUOTER_V2_ADDRESS ?? defaultByChain.quoter,
+    router: process.env.UNISWAP_SWAP_ROUTER_ADDRESS ?? defaultByChain.router,
+    factory: process.env.UNISWAP_V3_FACTORY_ADDRESS ?? defaultByChain.factory,
   };
 }
 
 export async function quoteExactInputSingle(input: UniswapQuoteInput): Promise<UniswapQuoteResult> {
   const provider = getProvider(input.wallet.rpcUrl);
-  const { quoter } = resolveAddresses();
+  const { quoter, factory } = resolveAddresses(input.wallet.chainId);
+
+  const factoryContract = new ethers.Contract(factory, FACTORY_ABI, provider);
+  const poolAddress = await factoryContract.getPool(input.tokenIn, input.tokenOut, input.fee);
+  if (!poolAddress || poolAddress === ethers.ZeroAddress) {
+    throw new Error(
+      `No Uniswap V3 pool found for this pair/fee on chain ${input.wallet.chainId}. Try another fee tier (500, 3000, 10000) or another token pair.`,
+    );
+  }
 
   const contract = new ethers.Contract(quoter, QUOTER_V2_ABI, provider);
-  const response = await contract.quoteExactInputSingle.staticCall({
-    tokenIn: input.tokenIn,
-    tokenOut: input.tokenOut,
-    amountIn: BigInt(input.amountIn),
-    fee: input.fee,
-    sqrtPriceLimitX96: 0n,
-  });
+  let response: unknown;
+  try {
+    response = await contract.quoteExactInputSingle.staticCall({
+      tokenIn: input.tokenIn,
+      tokenOut: input.tokenOut,
+      amountIn: BigInt(input.amountIn),
+      fee: input.fee,
+      sqrtPriceLimitX96: 0n,
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes('could not decode result data') || message.includes('BAD_DATA')) {
+      throw new Error(
+        `Quote failed from quoter contract on chain ${input.wallet.chainId}. This usually means wrong quoter address for network, no route at this fee, or stale RPC data.`,
+      );
+    }
+    throw error;
+  }
 
-  return { amountOut: response[0].toString() };
+  const amountOut =
+    Array.isArray(response) && response.length > 0
+      ? response[0]
+      : (response as { amountOut?: bigint }).amountOut;
+
+  if (amountOut === undefined || amountOut === null) {
+    throw new Error('Quote returned empty result.');
+  }
+
+  return { amountOut: amountOut.toString() };
 }
 
 export async function swapExactInputSingle(input: UniswapSwapInput): Promise<UniswapSwapResult> {
@@ -74,7 +124,7 @@ export async function swapExactInputSingle(input: UniswapSwapInput): Promise<Uni
 
   const provider = getProvider(input.wallet.rpcUrl);
   const signer = new ethers.Wallet(input.privateKey, provider);
-  const { router } = resolveAddresses();
+  const { router } = resolveAddresses(input.wallet.chainId);
   const quote = await quoteExactInputSingle(input);
 
   const quoteOut = BigInt(quote.amountOut);
