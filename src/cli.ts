@@ -23,6 +23,8 @@ import {
 } from './layers/execution/index.js';
 import {
   addRecommendation,
+  getRecentActionHistory,
+  getRecentUserMessages,
   getLogsPath,
   getMemoryPath,
   getRecommendationById,
@@ -676,6 +678,74 @@ function explainError(errorText: string): string {
     return 'It means swap simulation failed before submission. Common reasons: insufficient ETH for amount+gas, no available route/liquidity at chosen fee tier, or token transfer constraints.';
   }
   return `It means the operation failed with: ${errorText}`;
+}
+
+function humanizeAction(action: string): string {
+  switch (action) {
+    case 'wallet-balance':
+      return 'checked wallet balance';
+    case 'wallet-transfer':
+      return 'sent funds';
+    case 'swap-quote':
+      return 'requested a swap quote';
+    case 'swap-execute':
+      return 'executed a swap';
+    case 'mode':
+      return 'changed execution mode';
+    case 'recommend':
+      return 'generated a recommendation';
+    case 'execute':
+      return 'executed a recommendation';
+    default:
+      return action;
+  }
+}
+
+async function directMemoryAnswer(message: string): Promise<string[] | undefined> {
+  const lower = message.toLowerCase();
+  const asksLastQuestion =
+    /what did i ask (you )?(last time|before|previously)/i.test(message) ||
+    /what was my last (question|prompt|message)/i.test(message);
+
+  if (asksLastQuestion) {
+    const recentUserMessages = await getRecentUserMessages(8);
+    const previous = recentUserMessages.find((item) => item.trim().toLowerCase() !== lower.trim());
+    if (!previous) {
+      return ["I don't have a previous user message recorded yet in this workspace."];
+    }
+    return [`Your previous message was: "${previous}"`];
+  }
+
+  const asksActionHistory =
+    /what (actions|activity) (have )?(i|we) (done|performed)/i.test(message) ||
+    /what did i do (last|before|recently)/i.test(message) ||
+    /show (my )?(recent )?(history|activity)/i.test(message);
+
+  if (asksActionHistory) {
+    const recentActions = await getRecentActionHistory(30);
+    const successful = recentActions.filter((item) => item.phase === 'succeeded');
+    if (successful.length === 0) {
+      return ["I don't see any completed actions recorded yet."];
+    }
+
+    const uniqueActions: string[] = [];
+    for (const action of successful) {
+      const text = humanizeAction(action.action);
+      if (!uniqueActions.includes(text)) {
+        uniqueActions.push(text);
+      }
+      if (uniqueActions.length >= 5) {
+        break;
+      }
+    }
+
+    return [
+      'Here are your recent completed actions:',
+      ...uniqueActions.map((item, index) => `${index + 1}. ${item}`),
+    ];
+  }
+
+  return undefined;
 }
 
 async function buildActionSteps(
@@ -1445,6 +1515,12 @@ async function runChatMode(): Promise<void> {
 
       if (shouldExplainLastError(message) && lastErrorText) {
         await emitAssistantLine(explainError(lastErrorText));
+        continue;
+      }
+
+      const memoryAnswer = await directMemoryAnswer(message);
+      if (memoryAnswer) {
+        await emitAssistantLines(memoryAnswer);
         continue;
       }
 
