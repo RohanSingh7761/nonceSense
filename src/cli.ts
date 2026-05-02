@@ -567,14 +567,17 @@ function heuristicPlan(message: string): ActionPlan | undefined {
 
 async function directNetworkAnswer(message: string): Promise<string | undefined> {
   const lower = message.toLowerCase();
-  const asksNetwork =
-    lower.includes('mainnet') ||
-    lower.includes('sepolia') ||
+  const asksAction = /\b(balance|portfolio|funds|swap|quote|trade|send|transfer|recommend|execute)\b/.test(lower);
+  const asksNetworkStatus =
     lower.includes('which network') ||
     lower.includes('what network') ||
-    lower.includes('is this mainnet');
+    lower.includes('network am i on') ||
+    lower.includes('current network') ||
+    lower.includes('am i on') ||
+    lower.includes('is this mainnet') ||
+    lower.includes('is this sepolia');
 
-  if (!asksNetwork) {
+  if (!asksNetworkStatus || asksAction) {
     return undefined;
   }
 
