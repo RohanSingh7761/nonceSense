@@ -61,7 +61,7 @@ async function waitForTransactionOrTimeout(
   provider: ethers.Provider,
   txHash: string,
   label: string,
-): Promise<void> {
+): Promise<ethers.TransactionReceipt> {
   const timeoutMs = getTxTimeoutMs();
   const receipt = await provider.waitForTransaction(txHash, 1, timeoutMs);
   if (!receipt) {
@@ -70,6 +70,7 @@ async function waitForTransactionOrTimeout(
   if (receipt.status === 0) {
     throw new Error(`${label} failed on-chain. Tx hash: ${txHash}`);
   }
+  return receipt;
 }
 
 async function getExecutionDeadline(
@@ -103,6 +104,8 @@ export interface UniswapSwapInput extends UniswapQuoteInput {
 
 export interface UniswapSwapResult {
   transactionHash: string;
+  status: 'confirmed';
+  blockNumber: number;
 }
 
 function getProvider(rpcUrl: string): ethers.JsonRpcProvider {
@@ -343,7 +346,11 @@ export async function swapExactInputSingle(
   }
 
   const tx = await contract.exactInputSingle(params);
-  await waitForTransactionOrTimeout(provider, tx.hash as string, 'Swap execution');
+  const receipt = await waitForTransactionOrTimeout(provider, tx.hash as string, 'Swap execution');
 
-  return { transactionHash: tx.hash as string };
+  return {
+    transactionHash: tx.hash as string,
+    status: 'confirmed',
+    blockNumber: receipt.blockNumber,
+  };
 }

@@ -9,10 +9,14 @@ export interface NativeBalanceResult {
 
 export interface NativeTransferResult {
   transactionHash: string;
+  status: 'confirmed';
+  blockNumber: number;
 }
 
 export interface Erc20TransferResult {
   transactionHash: string;
+  status: 'confirmed';
+  blockNumber: number;
 }
 
 export interface TokenBalanceItem {
@@ -52,7 +56,7 @@ async function waitForTransactionOrTimeout(
   provider: ethers.Provider,
   txHash: string,
   label: string,
-): Promise<void> {
+): Promise<ethers.TransactionReceipt> {
   const timeoutMs = getTxTimeoutMs();
   const receipt = await provider.waitForTransaction(txHash, 1, timeoutMs);
   if (!receipt) {
@@ -61,6 +65,7 @@ async function waitForTransactionOrTimeout(
   if (receipt.status === 0) {
     throw new Error(`${label} failed on-chain. Tx hash: ${txHash}`);
   }
+  return receipt;
 }
 
 export async function getNativeBalance(walletConfig: WalletConfig): Promise<NativeBalanceResult> {
@@ -95,8 +100,12 @@ export async function transferNative(
   });
   const signedTx = await signer.signTransaction(txRequest);
   const broadcast = await provider.broadcastTransaction(signedTx);
-  await waitForTransactionOrTimeout(provider, broadcast.hash, 'Native transfer');
-  return { transactionHash: broadcast.hash };
+  const receipt = await waitForTransactionOrTimeout(provider, broadcast.hash, 'Native transfer');
+  return {
+    transactionHash: broadcast.hash,
+    status: 'confirmed',
+    blockNumber: receipt.blockNumber,
+  };
 }
 
 const ERC20_TRANSFER_ABI = [
@@ -121,8 +130,12 @@ export async function transferErc20(
   const amountRaw = ethers.parseUnits(amount, tokenDecimals);
 
   const tx = await contract.transfer(toAddress, amountRaw);
-  await waitForTransactionOrTimeout(provider, tx.hash as string, 'ERC-20 transfer');
-  return { transactionHash: tx.hash as string };
+  const receipt = await waitForTransactionOrTimeout(provider, tx.hash as string, 'ERC-20 transfer');
+  return {
+    transactionHash: tx.hash as string,
+    status: 'confirmed',
+    blockNumber: receipt.blockNumber,
+  };
 }
 
 interface AlchemyTokenBalancesResponse {

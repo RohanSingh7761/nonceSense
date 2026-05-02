@@ -762,6 +762,16 @@ function humanizeAction(action: string): string {
   }
 }
 
+function formatActionFailureMessage(action: string, errorText: string): string {
+  if (action === 'wallet-transfer') {
+    return `Transfer failed: ${errorText}`;
+  }
+  if (action === 'swap-execute') {
+    return `Swap failed: ${errorText}`;
+  }
+  return errorText;
+}
+
 async function directMemoryAnswer(message: string): Promise<string[] | undefined> {
   const lower = message.toLowerCase();
   const asksLastQuestion =
@@ -1037,6 +1047,8 @@ async function executeCommand(
           command: 'wallet-transfer',
           transferType: 'native',
           token: 'ETH',
+          status: tx.status,
+          blockNumber: tx.blockNumber,
           from: actionWallet.address,
           to: values.to,
           amountEth: values.amountEth,
@@ -1060,6 +1072,8 @@ async function executeCommand(
         transferType: 'erc20',
         token: token.symbol,
         tokenAddress: token.address,
+        status: tx.status,
+        blockNumber: tx.blockNumber,
         from: actionWallet.address,
         to: values.to,
         amountEth: values.amountEth,
@@ -1170,7 +1184,12 @@ async function executeCommand(
         slippageBps,
         useNativeIn: tokenInInput.toUpperCase() === 'ETH',
       });
-      return { command: 'swap-execute', transactionHash: tx.transactionHash };
+      return {
+        command: 'swap-execute',
+        transactionHash: tx.transactionHash,
+        status: tx.status,
+        blockNumber: tx.blockNumber,
+      };
     }
     case 'recommend': {
       const values = requireStringFlags(flags, ['tokenIn', 'tokenOut', 'amount']);
@@ -1421,9 +1440,12 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
       token?: string;
       transferType?: 'native' | 'erc20';
       tokenAddress?: string;
+      status?: string;
+      blockNumber?: number;
     };
     return [
       `${payload.transferType === 'erc20' ? 'Token transfer' : 'Transfer'} submitted${payload.chainId ? ` on ${getNetworkLabel(payload.chainId)}` : ''}.`,
+      `Status: ${payload.status ?? 'submitted'}${payload.blockNumber ? ` (block ${payload.blockNumber})` : ''}`,
       `Amount: ${payload.amountEth ?? 'unknown'} ${payload.token ?? 'ETH'}`,
       `To: ${payload.to ?? 'unknown'}`,
       ...(payload.tokenAddress ? [`Token: ${payload.tokenAddress}`] : []),
@@ -1445,9 +1467,13 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
   }
 
   if (action === 'swap-execute') {
-    const payload = result as { transactionHash?: string };
+    const payload = result as { transactionHash?: string; status?: string; blockNumber?: number };
     if (payload.transactionHash) {
-      return [`Swap submitted on Uniswap. Tx hash: ${payload.transactionHash}`];
+      return [
+        'Swap submitted on Uniswap.',
+        `Status: ${payload.status ?? 'submitted'}${payload.blockNumber ? ` (block ${payload.blockNumber})` : ''}`,
+        `Tx hash: ${payload.transactionHash}`,
+      ];
     }
   }
 
@@ -1501,6 +1527,19 @@ ${payloadJson}`;
   } catch {
     return fallback;
   }
+}
+
+async function composeActionResponse(action: CommandName, result: unknown): Promise<string[]> {
+  const narrated = await narrateActionResult(action, result);
+  const details = formatChatFriendlyResult(action, result);
+
+  const joinedNarrated = narrated.join('\n').trim();
+  const joinedDetails = details.join('\n').trim();
+  if (joinedNarrated === joinedDetails) {
+    return details;
+  }
+
+  return [...narrated, 'Details:', ...details];
 }
 
 function formatSwapConfirmationLines(
@@ -1601,7 +1640,7 @@ async function runChatMode(): Promise<void> {
             });
             lastErrorText = undefined;
             pendingSwapConfirmation = undefined;
-            await emitAssistantLines(await narrateActionResult('swap-execute', result));
+            await emitAssistantLines(await composeActionResponse('swap-execute', result));
           } catch (error: unknown) {
             const text = error instanceof Error ? error.message : String(error);
             await logActionEvent('swap-execute', 'failed', {
@@ -1616,7 +1655,7 @@ async function runChatMode(): Promise<void> {
             });
             lastErrorText = text;
             pendingSwapConfirmation = undefined;
-            await emitAssistantLine(text);
+            await emitAssistantLine(formatActionFailureMessage('swap-execute', text));
           }
           continue;
         }
@@ -1660,7 +1699,7 @@ async function runChatMode(): Promise<void> {
             await logActionEvent(enriched.action, 'succeeded', { source: 'pending-step' });
             lastErrorText = undefined;
             pendingStep = undefined;
-            await emitAssistantLines(await narrateActionResult(enriched.action, result));
+            await emitAssistantLines(await composeActionResponse(enriched.action, result));
             continue;
           } catch (error: unknown) {
             const text = error instanceof Error ? error.message : String(error);
@@ -1671,7 +1710,7 @@ async function runChatMode(): Promise<void> {
             if (text.startsWith('Missing required details:')) {
               await emitAssistantLine(humanizeMissingDetails(text));
             } else {
-              await emitAssistantLine(text);
+              await emitAssistantLine(formatActionFailureMessage(enriched.action, text));
             }
             continue;
           }
@@ -1766,7 +1805,7 @@ async function runChatMode(): Promise<void> {
           });
           lastErrorText = undefined;
           pendingStep = undefined;
-          await emitAssistantLines(await narrateActionResult(stepWithNetwork.action, result));
+          await emitAssistantLines(await composeActionResponse(stepWithNetwork.action, result));
 
           if (stepWithNetwork.action === 'wallet-balance') {
             const payload = result as { portfolio: { native: { ether: string } } };
@@ -1788,7 +1827,7 @@ async function runChatMode(): Promise<void> {
             await emitAssistantLine(humanizeMissingDetails(text));
           } else {
             pendingStep = undefined;
-            await emitAssistantLine(text);
+            await emitAssistantLine(formatActionFailureMessage(stepWithNetwork.action, text));
           }
         }
       }
