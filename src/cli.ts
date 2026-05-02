@@ -552,7 +552,7 @@ function enrichPendingStepFromMessage(step: ActionStep, message: string): Action
 function heuristicPlan(message: string): ActionPlan | undefined {
   const lower = message.toLowerCase();
   const chainId = detectChainIdFromText(message);
-  const networkFlags = chainId ? { chainId: `${chainId}` } : {};
+  const networkFlags: Record<string, string> = chainId ? { chainId: `${chainId}` } : {};
   const hasExecutionVerb = /\b(send|transfer|swap|trade|quote|execute)\b/.test(lower);
   const asksTokenHoldings =
     /\bhow much\s+[a-zA-Z0-9]{2,12}\s+do i have\b/.test(lower) ||
@@ -824,7 +824,7 @@ async function buildActionSteps(
   contextWindow: ChatContextTurn[],
 ): Promise<{ steps: ActionStep[]; reply?: string }> {
   const chainId = detectChainIdFromText(message);
-  const networkFlags = chainId ? { chainId: `${chainId}` } : {};
+  const networkFlags: Record<string, string> = chainId ? { chainId: `${chainId}` } : {};
   const conditional = parseConditionalBalanceQuote(message);
   if (conditional) {
     return {
