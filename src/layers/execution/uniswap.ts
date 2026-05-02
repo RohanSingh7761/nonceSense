@@ -37,6 +37,14 @@ const SEPOLIA_FACTORY = '0x0227628f3F023bb0B980b67D528571c95c6DaC1c';
 
 const MAINNET_FACTORY = '0x1F98431c8aD98523631AE4a59f267346ea31F984';
 
+function normalizeAddress(address: string, label = 'address'): string {
+  const value = address.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) {
+    throw new Error(`Invalid ${label}: ${address}`);
+  }
+  return ethers.getAddress(value.toLowerCase());
+}
+
 export interface UniswapQuoteInput {
   wallet: WalletConfig;
   tokenIn: string;
@@ -85,9 +93,9 @@ function resolveAddresses(chainId: number): {
         };
 
   return {
-    quoter: process.env.UNISWAP_QUOTER_V2_ADDRESS ?? defaultByChain.quoter,
-    router: process.env.UNISWAP_SWAP_ROUTER_ADDRESS ?? defaultByChain.router,
-    factory: process.env.UNISWAP_V3_FACTORY_ADDRESS ?? defaultByChain.factory,
+    quoter: normalizeAddress(process.env.UNISWAP_QUOTER_V2_ADDRESS ?? defaultByChain.quoter, 'quoter'),
+    router: normalizeAddress(process.env.UNISWAP_SWAP_ROUTER_ADDRESS ?? defaultByChain.router, 'router'),
+    factory: normalizeAddress(process.env.UNISWAP_V3_FACTORY_ADDRESS ?? defaultByChain.factory, 'factory'),
   };
 }
 
@@ -99,9 +107,13 @@ async function getPoolAddress(
   fee: number,
 ): Promise<string> {
   const { factory } = resolveAddresses(chainId);
-  const factoryContract = new ethers.Contract(factory, FACTORY_ABI, provider);
+  const factoryContract = new ethers.Contract(normalizeAddress(factory, 'factory'), FACTORY_ABI, provider);
 
-  const poolAddress = await factoryContract.getPool(tokenIn, tokenOut, fee);
+  const poolAddress = await factoryContract.getPool(
+    normalizeAddress(tokenIn, 'tokenIn'),
+    normalizeAddress(tokenOut, 'tokenOut'),
+    fee,
+  );
   if (!poolAddress || poolAddress === ethers.ZeroAddress) {
     throw new Error(
       `No Uniswap V3 pool found for this pair/fee on chain ${chainId}. Try fee tiers 500, 3000, 10000.`,
@@ -115,7 +127,7 @@ async function assertPoolHasLiquidity(
   provider: ethers.JsonRpcProvider,
   poolAddress: string,
 ): Promise<void> {
-  const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
+  const pool = new ethers.Contract(normalizeAddress(poolAddress, 'poolAddress'), POOL_ABI, provider);
   const liquidity = (await pool.liquidity()) as bigint;
 
   if (liquidity === 0n) {
@@ -130,8 +142,11 @@ async function ensureApproved(
   amount: bigint,
   signer: ethers.Wallet,
 ): Promise<void> {
-  const token = new ethers.Contract(tokenAddress, ERC20_ABI, signer);
-  const allowance = (await token.allowance(owner, spender)) as bigint;
+  const token = new ethers.Contract(normalizeAddress(tokenAddress, 'tokenAddress'), ERC20_ABI, signer);
+  const allowance = (await token.allowance(
+    normalizeAddress(owner, 'owner'),
+    normalizeAddress(spender, 'spender'),
+  )) as bigint;
 
   if (allowance < amount) {
     const approveTx = await token.approve(spender, ethers.MaxUint256);
@@ -145,8 +160,8 @@ async function ensureWrappedIfNeeded(
   amount: bigint,
   signer: ethers.Wallet,
 ): Promise<void> {
-  const weth = new ethers.Contract(tokenAddress, WETH_ABI, signer);
-  const balance = (await weth.balanceOf(owner)) as bigint;
+  const weth = new ethers.Contract(normalizeAddress(tokenAddress, 'tokenAddress'), WETH_ABI, signer);
+  const balance = (await weth.balanceOf(normalizeAddress(owner, 'owner'))) as bigint;
 
   if (balance < amount) {
     const wrapAmount = amount - balance;
@@ -159,12 +174,14 @@ export async function quoteExactInputSingle(
   input: UniswapQuoteInput,
 ): Promise<UniswapQuoteResult> {
   const provider = getProvider(input.wallet.rpcUrl);
+  const tokenIn = normalizeAddress(input.tokenIn, 'tokenIn');
+  const tokenOut = normalizeAddress(input.tokenOut, 'tokenOut');
 
   const poolAddress = await getPoolAddress(
     provider,
     input.wallet.chainId,
-    input.tokenIn,
-    input.tokenOut,
+    tokenIn,
+    tokenOut,
     input.fee,
   );
 
@@ -177,8 +194,8 @@ export async function quoteExactInputSingle(
 
   try {
     response = await contract.quoteExactInputSingle.staticCall({
-      tokenIn: input.tokenIn,
-      tokenOut: input.tokenOut,
+      tokenIn,
+      tokenOut,
       amountIn: BigInt(input.amountIn),
       fee: input.fee,
       sqrtPriceLimitX96: 0n,
@@ -224,6 +241,8 @@ export async function swapExactInputSingle(
   const provider = getProvider(input.wallet.rpcUrl);
   const signer = new ethers.Wallet(input.privateKey, provider);
   const owner = await signer.getAddress();
+  const tokenIn = normalizeAddress(input.tokenIn, 'tokenIn');
+  const tokenOut = normalizeAddress(input.tokenOut, 'tokenOut');
 
   const { router } = resolveAddresses(input.wallet.chainId);
   const amountIn = BigInt(input.amountIn);
@@ -231,14 +250,18 @@ export async function swapExactInputSingle(
   const poolAddress = await getPoolAddress(
     provider,
     input.wallet.chainId,
-    input.tokenIn,
-    input.tokenOut,
+    tokenIn,
+    tokenOut,
     input.fee,
   );
 
   await assertPoolHasLiquidity(provider, poolAddress);
 
-  const quote = await quoteExactInputSingle(input);
+  const quote = await quoteExactInputSingle({
+    ...input,
+    tokenIn,
+    tokenOut,
+  });
   const quoteOut = BigInt(quote.amountOut);
 
   // For Sepolia debugging, allow turning this off if liquidity is unstable.
@@ -248,18 +271,18 @@ export async function swapExactInputSingle(
       : (quoteOut * (10_000n - BigInt(input.slippageBps))) / 10_000n;
 
   if (input.useNativeIn) {
-    await ensureWrappedIfNeeded(input.tokenIn, owner, amountIn, signer);
+    await ensureWrappedIfNeeded(tokenIn, owner, amountIn, signer);
   }
 
-  await ensureApproved(input.tokenIn, owner, router, amountIn, signer);
+  await ensureApproved(tokenIn, owner, router, amountIn, signer);
 
-  const contract = new ethers.Contract(router, SWAP_ROUTER_ABI, signer);
+  const contract = new ethers.Contract(normalizeAddress(router, 'router'), SWAP_ROUTER_ABI, signer);
 
   const params = {
-    tokenIn: input.tokenIn,
-    tokenOut: input.tokenOut,
+    tokenIn,
+    tokenOut,
     fee: input.fee,
-    recipient: input.wallet.address,
+    recipient: normalizeAddress(input.wallet.address, 'recipient'),
     deadline: Math.floor(Date.now() / 1000) + 60 * 10,
     amountIn,
     amountOutMinimum,
