@@ -45,6 +45,17 @@ function normalizeAddress(address: string, label = 'address'): string {
   return ethers.getAddress(value.toLowerCase());
 }
 
+async function getExecutionDeadline(
+  provider: ethers.JsonRpcProvider,
+  ttlSeconds = 60 * 10,
+): Promise<number> {
+  const localNow = Math.floor(Date.now() / 1000);
+  const latestBlock = await provider.getBlock('latest');
+  const chainNow = latestBlock?.timestamp ?? localNow;
+  const base = Math.max(localNow, chainNow);
+  return base + ttlSeconds;
+}
+
 export interface UniswapQuoteInput {
   wallet: WalletConfig;
   tokenIn: string;
@@ -277,13 +288,14 @@ export async function swapExactInputSingle(
   await ensureApproved(tokenIn, owner, router, amountIn, signer);
 
   const contract = new ethers.Contract(normalizeAddress(router, 'router'), SWAP_ROUTER_ABI, signer);
+  const deadline = await getExecutionDeadline(provider);
 
   const params = {
     tokenIn,
     tokenOut,
     fee: input.fee,
     recipient: normalizeAddress(input.wallet.address, 'recipient'),
-    deadline: Math.floor(Date.now() / 1000) + 60 * 10,
+    deadline,
     amountIn,
     amountOutMinimum,
     sqrtPriceLimitX96: 0,
