@@ -1322,6 +1322,55 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
   return [JSON.stringify(result, null, 2)];
 }
 
+function stripMarkdownFences(text: string): string {
+  return text.replace(/```[\s\S]*?```/g, (block) =>
+    block.replace(/^```[a-zA-Z]*\s*/m, '').replace(/```$/m, '').trim(),
+  );
+}
+
+async function narrateActionResult(action: CommandName, result: unknown): Promise<string[]> {
+  const fallback = formatChatFriendlyResult(action, result);
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return fallback;
+  }
+
+  const payloadJson = JSON.stringify(result, null, 2);
+  const prompt = `You are NonceSense, a crypto assistant. Convert a structured action result into a concise human explanation.
+
+Rules:
+- Be factual and only use information present in the payload.
+- Explain naturally for a non-technical user.
+- Mention important outputs (network, amounts, token symbols, tx hash, wallet, mode, trigger outcome) when present.
+- Keep it concise (2-6 lines).
+- Do not output JSON.
+- Do not include markdown code fences.
+
+Action: ${action}
+Result payload:
+${payloadJson}`;
+
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
+    const response = await ai.models.generateContent({
+      model,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    });
+    const text = stripMarkdownFences((response.text ?? '').trim());
+    if (!text) {
+      return fallback;
+    }
+    const lines = text
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+    return lines.length > 0 ? lines : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function formatSwapConfirmationLines(
   quoteResult: unknown,
   flags: Record<string, string>,
@@ -1414,7 +1463,7 @@ async function runChatMode(): Promise<void> {
             });
             lastErrorText = undefined;
             pendingSwapConfirmation = undefined;
-            await emitAssistantLines(formatChatFriendlyResult('swap-execute', result));
+            await emitAssistantLines(await narrateActionResult('swap-execute', result));
           } catch (error: unknown) {
             const text = error instanceof Error ? error.message : String(error);
             await logActionEvent('swap-execute', 'failed', {
@@ -1473,7 +1522,7 @@ async function runChatMode(): Promise<void> {
             await logActionEvent(enriched.action, 'succeeded', { source: 'pending-step' });
             lastErrorText = undefined;
             pendingStep = undefined;
-            await emitAssistantLines(formatChatFriendlyResult(enriched.action, result));
+            await emitAssistantLines(await narrateActionResult(enriched.action, result));
             continue;
           } catch (error: unknown) {
             const text = error instanceof Error ? error.message : String(error);
@@ -1573,7 +1622,7 @@ async function runChatMode(): Promise<void> {
           });
           lastErrorText = undefined;
           pendingStep = undefined;
-          await emitAssistantLines(formatChatFriendlyResult(stepWithNetwork.action, result));
+          await emitAssistantLines(await narrateActionResult(stepWithNetwork.action, result));
 
           if (stepWithNetwork.action === 'wallet-balance') {
             const payload = result as { portfolio: { native: { ether: string } } };
