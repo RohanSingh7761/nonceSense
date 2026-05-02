@@ -28,10 +28,11 @@ if (command !== 'start') {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, '..');
-const launcher = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-const child = spawn(launcher, ['tsx', 'src/cli.ts'], {
+const launcher = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+const child = spawn(launcher, ['run', 'dev'], {
   cwd: repoRoot,
   stdio: 'inherit',
+  shell: process.platform === 'win32',
 });
 
 child.on('exit', (code, signal) => {
