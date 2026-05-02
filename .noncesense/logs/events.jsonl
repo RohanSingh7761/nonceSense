@@ -295,3 +295,26 @@
 {"timestamp":"2026-05-02T13:11:36.264Z","type":"chat","role":"assistant","message":"You're welcome!"}
 {"timestamp":"2026-05-02T13:11:42.064Z","type":"chat","role":"user","message":"what did I ask you last time"}
 {"timestamp":"2026-05-02T13:11:45.076Z","type":"chat","role":"assistant","message":"I don't have a memory for specific past questions, but I can help you with crypto-related tasks if you tell me what you'd like to do!"}
+{"timestamp":"2026-05-02T13:13:30.267Z","type":"error","message":"Aborted with Ctrl+C","context":{"source":"run-catch"}}
+{"timestamp":"2026-05-02T13:13:32.373Z","type":"system","message":"chat-mode-started","metadata":{"logsPath":"F:\\Rohan Folder\\Hackathon Stuff\\noncesense.worktrees\\copilot-worktree-2026-05-01T19-45-45\\.noncesense\\logs\\events.jsonl"}}
+{"timestamp":"2026-05-02T13:13:41.250Z","type":"chat","role":"user","message":"What was my last message to you"}
+{"timestamp":"2026-05-02T13:13:41.253Z","type":"chat","role":"assistant","message":"Your previous message was: \"what did I ask you last time\""}
+{"timestamp":"2026-05-02T13:13:52.420Z","type":"chat","role":"user","message":"What was my last action from you"}
+{"timestamp":"2026-05-02T13:13:55.272Z","type":"chat","role":"assistant","message":"My last action was replying to your message 'What was my last message to you'."}
+{"timestamp":"2026-05-02T13:14:10.441Z","type":"chat","role":"user","message":"What was my first message"}
+{"timestamp":"2026-05-02T13:14:12.742Z","type":"chat","role":"assistant","message":"I can only process crypto-related actions. I cannot retrieve your first message in our chat history."}
+{"timestamp":"2026-05-02T13:14:49.913Z","type":"chat","role":"user","message":"How much WETH do I have on mainnet"}
+{"timestamp":"2026-05-02T13:14:49.914Z","type":"action","action":"swap-quote","phase":"planned","metadata":{"chainId":"1"}}
+{"timestamp":"2026-05-02T13:14:49.915Z","type":"action","action":"swap-quote","phase":"started","metadata":{"chainId":"1"}}
+{"timestamp":"2026-05-02T13:14:49.917Z","type":"action","action":"swap-quote","phase":"failed","metadata":{"chainId":"1","error":"Missing required details: tokenIn, tokenOut"}}
+{"timestamp":"2026-05-02T13:14:49.917Z","type":"error","message":"Missing required details: tokenIn, tokenOut","context":{"action":"swap-quote","chainId":"1"}}
+{"timestamp":"2026-05-02T13:14:49.918Z","type":"chat","role":"assistant","message":"I need these details: input token (example: ETH), output token (example: USDC)."}
+{"timestamp":"2026-05-02T13:15:06.422Z","type":"chat","role":"user","message":"what is my balance on mainnet"}
+{"timestamp":"2026-05-02T13:15:06.422Z","type":"action","action":"wallet-balance","phase":"planned","metadata":{"chainId":"1"}}
+{"timestamp":"2026-05-02T13:15:06.423Z","type":"action","action":"wallet-balance","phase":"started","metadata":{"chainId":"1"}}
+{"timestamp":"2026-05-02T13:15:07.975Z","type":"action","action":"wallet-balance","phase":"succeeded","metadata":{"chainId":"1"}}
+{"timestamp":"2026-05-02T13:15:11.448Z","type":"chat","role":"assistant","message":"Your wallet `0x99DE72cD...753FfE1` on the Ethereum network holds 0.000077045 Ether. You also have 0.0005 WETH in this wallet."}
+{"timestamp":"2026-05-02T13:15:53.719Z","type":"chat","role":"user","message":"If I send 0.005 WETH to some wallet, do I need for WETH than this or only this since I already have some eth as well"}
+{"timestamp":"2026-05-02T13:15:53.719Z","type":"action","action":"swap-quote","phase":"planned","metadata":{"chainId":"unspecified"}}
+{"timestamp":"2026-05-02T13:15:53.720Z","type":"chat","role":"assistant","message":"Which network should I use for this action: Sepolia or Ethereum Mainnet?"}
+{"timestamp":"2026-05-02T13:17:09.902Z","type":"error","message":"Aborted with Ctrl+C","context":{"source":"run-catch"}}

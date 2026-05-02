@@ -553,13 +553,18 @@ function heuristicPlan(message: string): ActionPlan | undefined {
   const lower = message.toLowerCase();
   const chainId = detectChainIdFromText(message);
   const networkFlags = chainId ? { chainId: `${chainId}` } : {};
+  const hasExecutionVerb = /\b(send|transfer|swap|trade|quote|execute)\b/.test(lower);
+  const asksTokenHoldings =
+    /\bhow much\s+[a-zA-Z0-9]{2,12}\s+do i have\b/.test(lower) ||
+    /\bwhat(?:'s| is)\s+my\s+[a-zA-Z0-9]{2,12}\s+balance\b/.test(lower);
 
-  if (/\b(balance|portfolio|funds)\b/.test(lower)) {
+  if (/\b(balance|portfolio|funds)\b/.test(lower) || (asksTokenHoldings && !hasExecutionVerb)) {
     return { action: 'wallet-balance', flags: networkFlags, reply: 'Checking your balance.' };
   }
 
   const quote = parseSwapDetailsFromMessage(message);
-  const asksQuote = /\b(quote|price|how much)\b/.test(lower);
+  const hasSwapContext = /\b(swap|swapping|trade|convert|exchange)\b/.test(lower);
+  const asksQuote = /\b(quote|price|rate)\b/.test(lower) || (/\bhow much\b/.test(lower) && hasSwapContext);
   const asksSwapExecute = /\b(swap|execute|trade)\b/.test(lower) && !asksQuote;
   if (quote.tokenIn && quote.tokenOut && quote.amount) {
     return {
@@ -650,6 +655,62 @@ async function directNetworkAnswer(message: string): Promise<string | undefined>
   await ensureWalletReady();
   const { activeUser } = await getActiveUserFromConfig();
   return `You are on ${getNetworkLabel(activeUser.wallet.chainId)} (chain ${activeUser.wallet.chainId}).`;
+}
+
+function shouldUseGeneralReasoning(message: string): boolean {
+  const trimmed = message.trim();
+  const lower = trimmed.toLowerCase();
+  const hasAddress = /0x[a-fA-F0-9]{40}/.test(trimmed);
+  const startsAsCommand = /^(send|transfer|swap|quote|get|check|show|set)\b/i.test(trimmed);
+  const asksConceptual =
+    /^(if|what if)\b/i.test(trimmed) ||
+    /\b(do i need|should i|can i|would it|is it enough|why|how does)\b/.test(lower);
+  return asksConceptual && !hasAddress && !startsAsCommand;
+}
+
+async function directGeneralAnswer(
+  message: string,
+  contextWindow: ChatContextTurn[],
+): Promise<string | undefined> {
+  if (!shouldUseGeneralReasoning(message)) {
+    return undefined;
+  }
+
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    return 'I can explain that conceptually, but GEMINI_API_KEY is missing right now.';
+  }
+
+  const recentConversation =
+    contextWindow.length > 0
+      ? contextWindow.map((turn) => `${turn.role.toUpperCase()}: ${turn.message}`).join('\n')
+      : 'No prior conversation context.';
+
+  const prompt = `You are a helpful crypto assistant. Answer the user's question conversationally.
+
+Rules:
+- This is a conceptual/help question. Do NOT trigger or suggest executing actions.
+- Be concise and practical.
+- If the question depends on specific balances/amounts, explain the rule clearly.
+
+Recent conversation:
+${recentConversation}
+
+User question:
+${message}`;
+
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
+    const response = await ai.models.generateContent({
+      model,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    });
+    const text = (response.text ?? '').trim();
+    return text || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function shouldExplainLastError(message: string): boolean {
@@ -843,6 +904,7 @@ Rules:
 - For mode changes, use action=mode and flags.set.
 - For setup, user may provide no args. Use action=setup with empty flags to auto-create wallet.
 - If user asks "how/steps" instead of executing, set action=none and explain in reply.
+- If user asks a hypothetical or conceptual question (for example starts with "if", "what if", "do I need", "should I"), set action=none.
 - For transfers, extract recipient address, amount, and token symbol (ETH or ERC-20 like WETH) from natural language.
 - For swap quotes, extract amount + token pair from natural language (example: "0.007 eth with usdc").
 - If user message specifies network, set flags.chainId to "1" for mainnet and "11155111" for sepolia.
@@ -1620,6 +1682,12 @@ async function runChatMode(): Promise<void> {
       const directAnswer = await directNetworkAnswer(message);
       if (directAnswer) {
         await emitAssistantLine(directAnswer);
+        continue;
+      }
+
+      const generalAnswer = await directGeneralAnswer(message, contextWindow);
+      if (generalAnswer) {
+        await emitAssistantLine(generalAnswer);
         continue;
       }
 
