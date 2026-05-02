@@ -17,6 +17,7 @@ import {
   getNativeBalance,
   getWalletPortfolio,
   quoteExactInputSingle,
+  resolveRecipientAddress,
   swapExactInputSingle,
   transferErc20,
   transferNative,
@@ -40,6 +41,7 @@ import {
 import { evaluateExecutionPolicy } from './layers/policy/index.js';
 import { evaluateTrigger } from './layers/trigger/index.js';
 import type { Recommendation, UserMode } from './types/index.js';
+import { startNewsMonitor, type WalletSnapshot } from './agents/news-monitor.js';
 
 type CommandName =
   | 'help'
@@ -104,6 +106,7 @@ const MAX_CONTEXT_TURNS = 12;
 const UI = {
   reset: '\x1b[0m',
   cyan: '\x1b[36m',
+  magenta: '\x1b[35m',
   dim: '\x1b[2m',
   bold: '\x1b[1m',
 };
@@ -425,8 +428,9 @@ function extractJsonObject(text: string): string {
 
 function parseTransferFromMessage(message: string): { to?: string; amountEth?: string; token?: string } {
   const addressMatch = message.match(/0x[a-fA-F0-9]{40}/);
+  const ensMatch = message.match(/\b[a-z0-9-]+\.eth\b/i);
   const explicitTokenMatch = message.match(
-    /(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s+to\s+0x[a-fA-F0-9]{40}/i,
+    /(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s+to\s+(?:0x[a-fA-F0-9]{40}|[a-z0-9-]+\.eth)\b/i,
   );
   const ethMatch = message.match(/(\d+(\.\d+)?)\s*eth\b/i);
   let amount = explicitTokenMatch?.[1] ?? ethMatch?.[1];
@@ -444,7 +448,7 @@ function parseTransferFromMessage(message: string): { to?: string; amountEth?: s
   }
 
   return {
-    to: addressMatch?.[0],
+    to: addressMatch?.[0] ?? ensMatch?.[0],
     amountEth: amount,
     token,
   };
@@ -579,7 +583,9 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     };
   }
 
-  if (/\b(send|transfer)\b/.test(lower) && /\beth\b/i.test(message) && /0x[a-fA-F0-9]{40}/.test(message)) {
+  const hasRecipientHint = /0x[a-fA-F0-9]{40}/.test(message) || /\b[a-z0-9-]+\.eth\b/i.test(message);
+
+  if (/\b(send|transfer)\b/.test(lower) && /\beth\b/i.test(message) && hasRecipientHint) {
     const parsed = parseTransferFromMessage(message);
     return {
       action: 'wallet-transfer',
@@ -593,7 +599,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     };
   }
 
-  if (/\b(send|transfer)\b/.test(lower) && /0x[a-fA-F0-9]{40}/.test(message)) {
+  if (/\b(send|transfer)\b/.test(lower) && hasRecipientHint) {
     const parsed = parseTransferFromMessage(message);
     return {
       action: 'wallet-transfer',
@@ -915,7 +921,7 @@ Rules:
 - For setup, user may provide no args. Use action=setup with empty flags to auto-create wallet.
 - If user asks "how/steps" instead of executing, set action=none and explain in reply.
 - If user asks a hypothetical or conceptual question (for example starts with "if", "what if", "do I need", "should I"), set action=none.
-- For transfers, extract recipient address, amount, and token symbol (ETH or ERC-20 like WETH) from natural language.
+- For transfers, extract recipient (0x address or ENS like name.eth), amount, and token symbol (ETH or ERC-20 like WETH) from natural language.
 - For swap quotes, extract amount + token pair from natural language (example: "0.007 eth with usdc").
 - If user message specifies network, set flags.chainId to "1" for mainnet and "11155111" for sepolia.
 - If network is not specified for balance/transfer/swap actions, do not invent one.
@@ -1039,10 +1045,11 @@ async function executeCommand(
       const values = requireStringFlags(flags, ['to', 'amountEth']);
       const actionWallet = await getWalletForAction(flags);
       const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
+      const recipient = await resolveRecipientAddress(actionWallet, values.to);
       const tokenInput = (asStringFlag(flags, 'token') ?? 'ETH').toUpperCase();
 
       if (tokenInput === 'ETH') {
-        const tx = await transferNative(actionWallet, privateKey, values.to, values.amountEth);
+        const tx = await transferNative(actionWallet, privateKey, recipient.resolvedAddress, values.amountEth);
         return {
           command: 'wallet-transfer',
           transferType: 'native',
@@ -1050,7 +1057,9 @@ async function executeCommand(
           status: tx.status,
           blockNumber: tx.blockNumber,
           from: actionWallet.address,
-          to: values.to,
+          to: recipient.resolvedAddress,
+          recipientInput: recipient.input,
+          ensName: recipient.ensName,
           amountEth: values.amountEth,
           chainId: actionWallet.chainId,
           rpcHost: getRpcHost(actionWallet.rpcUrl),
@@ -1064,7 +1073,7 @@ async function executeCommand(
         privateKey,
         token.address,
         token.decimals,
-        values.to,
+        recipient.resolvedAddress,
         values.amountEth,
       );
       return {
@@ -1075,7 +1084,9 @@ async function executeCommand(
         status: tx.status,
         blockNumber: tx.blockNumber,
         from: actionWallet.address,
-        to: values.to,
+        to: recipient.resolvedAddress,
+        recipientInput: recipient.input,
+        ensName: recipient.ensName,
         amountEth: values.amountEth,
         chainId: actionWallet.chainId,
         rpcHost: getRpcHost(actionWallet.rpcUrl),
@@ -1442,12 +1453,17 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
       tokenAddress?: string;
       status?: string;
       blockNumber?: number;
+      recipientInput?: string;
+      ensName?: string;
     };
     return [
       `${payload.transferType === 'erc20' ? 'Token transfer' : 'Transfer'} submitted${payload.chainId ? ` on ${getNetworkLabel(payload.chainId)}` : ''}.`,
       `Status: ${payload.status ?? 'submitted'}${payload.blockNumber ? ` (block ${payload.blockNumber})` : ''}`,
       `Amount: ${payload.amountEth ?? 'unknown'} ${payload.token ?? 'ETH'}`,
-      `To: ${payload.to ?? 'unknown'}`,
+      ...(payload.recipientInput && payload.recipientInput !== payload.to
+        ? [`Recipient input: ${payload.recipientInput}`]
+        : []),
+      ...(payload.ensName ? [`ENS resolved to: ${payload.to ?? 'unknown'}`] : [`To: ${payload.to ?? 'unknown'}`]),
       ...(payload.tokenAddress ? [`Token: ${payload.tokenAddress}`] : []),
       `RPC: ${payload.rpcHost ?? 'unknown'}`,
       `Tx hash: ${payload.transactionHash ?? 'unknown'}`,
@@ -1542,6 +1558,50 @@ async function composeActionResponse(action: CommandName, result: unknown): Prom
   return [...narrated, 'Details:', ...details];
 }
 
+async function buildWalletSnapshotForNewsAgent(): Promise<WalletSnapshot> {
+  await ensureWalletReady();
+  const { activeUser } = await getActiveUserFromConfig();
+  const networks: WalletSnapshot['networks'] = [];
+  const candidates = [
+    { chainId: 1, rpcUrl: getRpcUrlForChainId(1) },
+    { chainId: 11155111, rpcUrl: getRpcUrlForChainId(11155111) },
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate.rpcUrl) {
+      continue;
+    }
+    try {
+      const portfolio = await getWalletPortfolio({
+        address: activeUser.wallet.address,
+        chainId: candidate.chainId,
+        rpcUrl: candidate.rpcUrl,
+      });
+      networks.push({
+        chainId: candidate.chainId,
+        network: getNetworkLabel(candidate.chainId),
+        nativeEth: portfolio.native.ether,
+        tokens: portfolio.tokens.slice(0, 8).map((token) => ({
+          symbol: token.symbol,
+          balance: token.balanceFormatted,
+        })),
+      });
+    } catch {
+      networks.push({
+        chainId: candidate.chainId,
+        network: getNetworkLabel(candidate.chainId),
+        nativeEth: 'unavailable',
+        tokens: [],
+      });
+    }
+  }
+
+  return {
+    address: activeUser.wallet.address,
+    networks,
+  };
+}
+
 function formatSwapConfirmationLines(
   quoteResult: unknown,
   flags: Record<string, string>,
@@ -1584,6 +1644,12 @@ async function runChatMode(): Promise<void> {
       await emitAssistantLine(line);
     }
   };
+  const emitMarketLines = async (lines: string[]): Promise<void> => {
+    for (const line of lines) {
+      console.log(`${UI.magenta}${line}${UI.reset}`);
+      await logChatMessage('assistant', `[market-agent] ${line}`);
+    }
+  };
 
   if (initialized.created) {
     await emitAssistantLine('I created a new wallet for you (first-time setup).');
@@ -1593,6 +1659,12 @@ async function runChatMode(): Promise<void> {
       await emitAssistantLine('Save this private key securely. It is stored locally for chat execution.');
     }
   }
+  const stopNewsMonitor = startNewsMonitor({
+    getWalletSnapshot: buildWalletSnapshotForNewsAgent,
+    onRecommendation: emitMarketLines,
+    intervalMs: 5 * 60 * 1000,
+  });
+  await emitMarketLines(['[Market Agent] Live monitor started (checks Ethereum news every 5 minutes).']);
   const rl = createInterface({ input, output });
   let lastErrorText: string | undefined;
   let pendingStep: ActionStep | undefined;
@@ -1833,6 +1905,7 @@ async function runChatMode(): Promise<void> {
       }
     }
   } finally {
+    stopNewsMonitor();
     rl.close();
   }
 }

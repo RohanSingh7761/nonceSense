@@ -33,11 +33,50 @@ export interface WalletPortfolio {
   tokens: TokenBalanceItem[];
 }
 
+export interface ResolvedRecipient {
+  input: string;
+  resolvedAddress: string;
+  ensName?: string;
+}
+
 function createProvider(walletConfig: WalletConfig): ethers.JsonRpcProvider {
   if (!walletConfig.rpcUrl) {
     throw new Error('Wallet RPC URL is missing. Run setup first.');
   }
   return new ethers.JsonRpcProvider(walletConfig.rpcUrl);
+}
+
+function normalizeAddress(address: string, label: string): string {
+  const value = address.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(value)) {
+    throw new Error(`Invalid ${label}: ${address}`);
+  }
+  return ethers.getAddress(value.toLowerCase());
+}
+
+export async function resolveRecipientAddress(
+  walletConfig: WalletConfig,
+  recipientInput: string,
+): Promise<ResolvedRecipient> {
+  const provider = createProvider(walletConfig);
+  const input = recipientInput.trim();
+
+  if (input.toLowerCase().endsWith('.eth')) {
+    const resolved = await provider.resolveName(input);
+    if (!resolved) {
+      throw new Error(`Could not resolve ENS name: ${input}`);
+    }
+    return {
+      input,
+      ensName: input,
+      resolvedAddress: normalizeAddress(resolved, 'resolved ENS address'),
+    };
+  }
+
+  return {
+    input,
+    resolvedAddress: normalizeAddress(input, 'recipient address'),
+  };
 }
 
 function getTxTimeoutMs(): number {
@@ -94,8 +133,9 @@ export async function transferNative(
   const provider = createProvider(walletConfig);
   const signer = new ethers.Wallet(privateKey, provider);
   const value = ethers.parseEther(amountEth);
+  const to = normalizeAddress(toAddress, 'recipient address');
   const txRequest = await signer.populateTransaction({
-    to: toAddress,
+    to,
     value,
   });
   const signedTx = await signer.signTransaction(txRequest);
@@ -126,10 +166,11 @@ export async function transferErc20(
 
   const provider = createProvider(walletConfig);
   const signer = new ethers.Wallet(privateKey, provider);
-  const contract = new ethers.Contract(tokenAddress, ERC20_TRANSFER_ABI, signer);
+  const contract = new ethers.Contract(normalizeAddress(tokenAddress, 'tokenAddress'), ERC20_TRANSFER_ABI, signer);
   const amountRaw = ethers.parseUnits(amount, tokenDecimals);
+  const to = normalizeAddress(toAddress, 'recipient address');
 
-  const tx = await contract.transfer(toAddress, amountRaw);
+  const tx = await contract.transfer(to, amountRaw);
   const receipt = await waitForTransactionOrTimeout(provider, tx.hash as string, 'ERC-20 transfer');
   return {
     transactionHash: tx.hash as string,

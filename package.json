@@ -2,10 +2,14 @@
   "name": "noncesense",
   "version": "1.0.0",
   "type": "module",
+  "bin": {
+    "ns": "./bin/ns.js"
+  },
   "main": "dist/cli.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/cli.ts",
+    "ns:start": "node ./bin/ns.js start",
     "start": "node dist/cli.js",
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck"
