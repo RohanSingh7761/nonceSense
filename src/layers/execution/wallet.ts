@@ -11,6 +11,10 @@ export interface NativeTransferResult {
   transactionHash: string;
 }
 
+export interface Erc20TransferResult {
+  transactionHash: string;
+}
+
 export interface TokenBalanceItem {
   symbol: string;
   name: string;
@@ -30,6 +34,33 @@ function createProvider(walletConfig: WalletConfig): ethers.JsonRpcProvider {
     throw new Error('Wallet RPC URL is missing. Run setup first.');
   }
   return new ethers.JsonRpcProvider(walletConfig.rpcUrl);
+}
+
+function getTxTimeoutMs(): number {
+  const raw = process.env.TX_CONFIRM_TIMEOUT_MS;
+  if (!raw) {
+    return 120_000;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 120_000;
+  }
+  return parsed;
+}
+
+async function waitForTransactionOrTimeout(
+  provider: ethers.Provider,
+  txHash: string,
+  label: string,
+): Promise<void> {
+  const timeoutMs = getTxTimeoutMs();
+  const receipt = await provider.waitForTransaction(txHash, 1, timeoutMs);
+  if (!receipt) {
+    throw new Error(`${label} confirmation timed out after ${timeoutMs}ms. Tx hash: ${txHash}`);
+  }
+  if (receipt.status === 0) {
+    throw new Error(`${label} failed on-chain. Tx hash: ${txHash}`);
+  }
 }
 
 export async function getNativeBalance(walletConfig: WalletConfig): Promise<NativeBalanceResult> {
@@ -64,7 +95,34 @@ export async function transferNative(
   });
   const signedTx = await signer.signTransaction(txRequest);
   const broadcast = await provider.broadcastTransaction(signedTx);
+  await waitForTransactionOrTimeout(provider, broadcast.hash, 'Native transfer');
   return { transactionHash: broadcast.hash };
+}
+
+const ERC20_TRANSFER_ABI = [
+  'function transfer(address to,uint256 amount) returns (bool)',
+];
+
+export async function transferErc20(
+  walletConfig: WalletConfig,
+  privateKey: string,
+  tokenAddress: string,
+  tokenDecimals: number,
+  toAddress: string,
+  amount: string,
+): Promise<Erc20TransferResult> {
+  if (!privateKey) {
+    throw new Error('PRIVATE_KEY is missing in environment.');
+  }
+
+  const provider = createProvider(walletConfig);
+  const signer = new ethers.Wallet(privateKey, provider);
+  const contract = new ethers.Contract(tokenAddress, ERC20_TRANSFER_ABI, signer);
+  const amountRaw = ethers.parseUnits(amount, tokenDecimals);
+
+  const tx = await contract.transfer(toAddress, amountRaw);
+  await waitForTransactionOrTimeout(provider, tx.hash as string, 'ERC-20 transfer');
+  return { transactionHash: tx.hash as string };
 }
 
 interface AlchemyTokenBalancesResponse {

@@ -45,6 +45,33 @@ function normalizeAddress(address: string, label = 'address'): string {
   return ethers.getAddress(value.toLowerCase());
 }
 
+function getTxTimeoutMs(): number {
+  const raw = process.env.TX_CONFIRM_TIMEOUT_MS;
+  if (!raw) {
+    return 120_000;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 120_000;
+  }
+  return parsed;
+}
+
+async function waitForTransactionOrTimeout(
+  provider: ethers.Provider,
+  txHash: string,
+  label: string,
+): Promise<void> {
+  const timeoutMs = getTxTimeoutMs();
+  const receipt = await provider.waitForTransaction(txHash, 1, timeoutMs);
+  if (!receipt) {
+    throw new Error(`${label} confirmation timed out after ${timeoutMs}ms. Tx hash: ${txHash}`);
+  }
+  if (receipt.status === 0) {
+    throw new Error(`${label} failed on-chain. Tx hash: ${txHash}`);
+  }
+}
+
 async function getExecutionDeadline(
   provider: ethers.JsonRpcProvider,
   ttlSeconds = 60 * 10,
@@ -160,8 +187,11 @@ async function ensureApproved(
   )) as bigint;
 
   if (allowance < amount) {
+    if (!signer.provider) {
+      throw new Error('Signer provider is missing for token approval.');
+    }
     const approveTx = await token.approve(spender, ethers.MaxUint256);
-    await approveTx.wait();
+    await waitForTransactionOrTimeout(signer.provider, approveTx.hash as string, 'Token approve');
   }
 }
 
@@ -175,9 +205,12 @@ async function ensureWrappedIfNeeded(
   const balance = (await weth.balanceOf(normalizeAddress(owner, 'owner'))) as bigint;
 
   if (balance < amount) {
+    if (!signer.provider) {
+      throw new Error('Signer provider is missing for WETH wrap.');
+    }
     const wrapAmount = amount - balance;
     const wrapTx = await weth.deposit({ value: wrapAmount });
-    await wrapTx.wait();
+    await waitForTransactionOrTimeout(signer.provider, wrapTx.hash as string, 'WETH wrap');
   }
 }
 
@@ -310,7 +343,7 @@ export async function swapExactInputSingle(
   }
 
   const tx = await contract.exactInputSingle(params);
-  await tx.wait();
+  await waitForTransactionOrTimeout(provider, tx.hash as string, 'Swap execution');
 
   return { transactionHash: tx.hash as string };
 }

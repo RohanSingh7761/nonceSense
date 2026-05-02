@@ -18,6 +18,7 @@ import {
   getWalletPortfolio,
   quoteExactInputSingle,
   swapExactInputSingle,
+  transferErc20,
   transferNative,
 } from './layers/execution/index.js';
 import {
@@ -98,6 +99,12 @@ let tokenListCache:
   | undefined;
 
 const MAX_CONTEXT_TURNS = 12;
+const UI = {
+  reset: '\x1b[0m',
+  cyan: '\x1b[36m',
+  dim: '\x1b[2m',
+  bold: '\x1b[1m',
+};
 
 function isAffirmative(message: string): boolean {
   const normalized = message.trim().toLowerCase();
@@ -351,6 +358,7 @@ Usage:
 Chat examples:
   "What is my balance on sepolia?"
   "Send 0.001 ETH to 0x... on mainnet"
+  "Send 0.01 WETH to 0x... on mainnet"
   "Give me quote for swapping 0.007 ETH to USDC on sepolia"
   "What is my balance, and if above 0.005 ETH then quote ETH to USDC on mainnet"
   "Set mode to assisted execution"
@@ -413,12 +421,30 @@ function extractJsonObject(text: string): string {
   throw new Error('No JSON object found in model response.');
 }
 
-function parseTransferFromMessage(message: string): { to?: string; amountEth?: string } {
+function parseTransferFromMessage(message: string): { to?: string; amountEth?: string; token?: string } {
   const addressMatch = message.match(/0x[a-fA-F0-9]{40}/);
-  const amountMatch = message.match(/(\d+(\.\d+)?)\s*eth\b/i);
+  const explicitTokenMatch = message.match(
+    /(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s+to\s+0x[a-fA-F0-9]{40}/i,
+  );
+  const ethMatch = message.match(/(\d+(\.\d+)?)\s*eth\b/i);
+  let amount = explicitTokenMatch?.[1] ?? ethMatch?.[1];
+  let token = explicitTokenMatch?.[3]?.toUpperCase();
+
+  if (!token && ethMatch) {
+    token = 'ETH';
+  }
+
+  if (!token) {
+    const tokenHint = message.match(/\b(weth|usdc|usdt|dai|wbtc|link|aave)\b/i);
+    if (tokenHint) {
+      token = tokenHint[1].toUpperCase();
+    }
+  }
+
   return {
     to: addressMatch?.[0],
-    amountEth: amountMatch?.[1],
+    amountEth: amount,
+    token,
   };
 }
 
@@ -499,6 +525,7 @@ function enrichPendingStepFromMessage(step: ActionStep, message: string): Action
     const extracted = parseTransferFromMessage(message);
     if (!enriched.flags.to && extracted.to) enriched.flags.to = extracted.to;
     if (!enriched.flags.amountEth && extracted.amountEth) enriched.flags.amountEth = extracted.amountEth;
+    if (!enriched.flags.token && extracted.token) enriched.flags.token = extracted.token;
     return enriched;
   }
 
@@ -553,6 +580,21 @@ function heuristicPlan(message: string): ActionPlan | undefined {
         ...networkFlags,
         ...(parsed.to ? { to: parsed.to } : {}),
         ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
+        ...(parsed.token ? { token: parsed.token } : {}),
+      },
+      reply: 'Preparing transfer.',
+    };
+  }
+
+  if (/\b(send|transfer)\b/.test(lower) && /0x[a-fA-F0-9]{40}/.test(message)) {
+    const parsed = parseTransferFromMessage(message);
+    return {
+      action: 'wallet-transfer',
+      flags: {
+        ...networkFlags,
+        ...(parsed.to ? { to: parsed.to } : {}),
+        ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
+        ...(parsed.token ? { token: parsed.token } : {}),
       },
       reply: 'Preparing transfer.',
     };
@@ -731,7 +773,7 @@ Rules:
 - For mode changes, use action=mode and flags.set.
 - For setup, user may provide no args. Use action=setup with empty flags to auto-create wallet.
 - If user asks "how/steps" instead of executing, set action=none and explain in reply.
-- For transfers, extract recipient address and ETH amount from natural language.
+- For transfers, extract recipient address, amount, and token symbol (ETH or ERC-20 like WETH) from natural language.
 - For swap quotes, extract amount + token pair from natural language (example: "0.007 eth with usdc").
 - If user message specifies network, set flags.chainId to "1" for mainnet and "11155111" for sepolia.
 - If network is not specified for balance/transfer/swap actions, do not invent one.
@@ -855,9 +897,37 @@ async function executeCommand(
       const values = requireStringFlags(flags, ['to', 'amountEth']);
       const actionWallet = await getWalletForAction(flags);
       const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
-      const tx = await transferNative(actionWallet, privateKey, values.to, values.amountEth);
+      const tokenInput = (asStringFlag(flags, 'token') ?? 'ETH').toUpperCase();
+
+      if (tokenInput === 'ETH') {
+        const tx = await transferNative(actionWallet, privateKey, values.to, values.amountEth);
+        return {
+          command: 'wallet-transfer',
+          transferType: 'native',
+          token: 'ETH',
+          from: actionWallet.address,
+          to: values.to,
+          amountEth: values.amountEth,
+          chainId: actionWallet.chainId,
+          rpcHost: getRpcHost(actionWallet.rpcUrl),
+          transactionHash: tx.transactionHash,
+        };
+      }
+
+      const token = await resolveToken(actionWallet.chainId, tokenInput, asStringFlag(flags, 'tokenDecimals'));
+      const tx = await transferErc20(
+        actionWallet,
+        privateKey,
+        token.address,
+        token.decimals,
+        values.to,
+        values.amountEth,
+      );
       return {
         command: 'wallet-transfer',
+        transferType: 'erc20',
+        token: token.symbol,
+        tokenAddress: token.address,
         from: actionWallet.address,
         to: values.to,
         amountEth: values.amountEth,
@@ -1216,11 +1286,15 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
       to?: string;
       chainId?: number;
       rpcHost?: string;
+      token?: string;
+      transferType?: 'native' | 'erc20';
+      tokenAddress?: string;
     };
     return [
-      `Transfer submitted${payload.chainId ? ` on ${getNetworkLabel(payload.chainId)}` : ''}.`,
-      `Amount: ${payload.amountEth ?? 'unknown'} ETH`,
+      `${payload.transferType === 'erc20' ? 'Token transfer' : 'Transfer'} submitted${payload.chainId ? ` on ${getNetworkLabel(payload.chainId)}` : ''}.`,
+      `Amount: ${payload.amountEth ?? 'unknown'} ${payload.token ?? 'ETH'}`,
       `To: ${payload.to ?? 'unknown'}`,
+      ...(payload.tokenAddress ? [`Token: ${payload.tokenAddress}`] : []),
       `RPC: ${payload.rpcHost ?? 'unknown'}`,
       `Tx hash: ${payload.transactionHash ?? 'unknown'}`,
     ];
@@ -1273,12 +1347,15 @@ function formatSwapConfirmationLines(
 }
 
 async function runChatMode(): Promise<void> {
-  console.log('NonceSense chat mode started. Ask naturally (type "exit" to quit).');
+  console.log('');
+  console.log(`${UI.bold}NonceSense${UI.reset}`);
+  console.log(`${UI.dim}Natural chat mode · type /exit to quit${UI.reset}`);
+  console.log('');
   await logSystemEvent('chat-mode-started', { logsPath: getLogsPath() });
   const initialized = await ensureWalletReady();
   const contextWindow: ChatContextTurn[] = [];
   const emitAssistantLine = async (line: string): Promise<void> => {
-    console.log(`Assistant: ${line}`);
+    console.log(`${UI.cyan}${line}${UI.reset}`);
     addContextTurn(contextWindow, 'assistant', line);
     await logChatMessage('assistant', line);
   };
@@ -1302,13 +1379,17 @@ async function runChatMode(): Promise<void> {
   let pendingSwapConfirmation: PendingSwapConfirmation | undefined;
   try {
     while (true) {
-      const message = (await rl.question('You: ')).trim();
+      const message = (await rl.question(`${UI.dim}> ${UI.reset}`)).trim();
       if (!message) {
         continue;
       }
       await logChatMessage('user', message);
       addContextTurn(contextWindow, 'user', message);
-      if (message.toLowerCase() === 'exit' || message.toLowerCase() === 'quit') {
+      if (
+        message.toLowerCase() === 'exit' ||
+        message.toLowerCase() === 'quit' ||
+        message.toLowerCase() === '/exit'
+      ) {
         await logSystemEvent('chat-mode-exit');
         break;
       }
@@ -1443,6 +1524,9 @@ async function runChatMode(): Promise<void> {
           }
           if (!stepWithNetwork.flags.amountEth && extracted.amountEth) {
             stepWithNetwork.flags.amountEth = extracted.amountEth;
+          }
+          if (!stepWithNetwork.flags.token && extracted.token) {
+            stepWithNetwork.flags.token = extracted.token;
           }
         }
 
