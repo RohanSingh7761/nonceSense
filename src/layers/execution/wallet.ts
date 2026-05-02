@@ -58,13 +58,13 @@ export async function transferNative(
   const provider = createProvider(walletConfig);
   const signer = new ethers.Wallet(privateKey, provider);
   const value = ethers.parseEther(amountEth);
-
-  const tx = await signer.sendTransaction({
+  const txRequest = await signer.populateTransaction({
     to: toAddress,
     value,
   });
-
-  return { transactionHash: tx.hash };
+  const signedTx = await signer.signTransaction(txRequest);
+  const broadcast = await provider.broadcastTransaction(signedTx);
+  return { transactionHash: broadcast.hash };
 }
 
 interface AlchemyTokenBalancesResponse {

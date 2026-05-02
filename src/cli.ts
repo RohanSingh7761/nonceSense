@@ -146,6 +146,14 @@ function getNetworkPromptText(): string {
   return 'Which network should I use for this action: Sepolia or Ethereum Mainnet?';
 }
 
+function getRpcHost(rpcUrl: string): string {
+  try {
+    return new URL(rpcUrl).host;
+  } catch {
+    return 'unknown';
+  }
+}
+
 function getTokenDirectory(chainId: number): Record<string, TokenMetadata> {
   if (chainId === 11155111) {
     return {
@@ -854,6 +862,7 @@ async function executeCommand(
         to: values.to,
         amountEth: values.amountEth,
         chainId: actionWallet.chainId,
+        rpcHost: getRpcHost(actionWallet.rpcUrl),
         transactionHash: tx.transactionHash,
       };
     }
@@ -1201,11 +1210,18 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
   }
 
   if (action === 'wallet-transfer') {
-    const payload = result as { transactionHash?: string; amountEth?: string; to?: string; chainId?: number };
+    const payload = result as {
+      transactionHash?: string;
+      amountEth?: string;
+      to?: string;
+      chainId?: number;
+      rpcHost?: string;
+    };
     return [
       `Transfer submitted${payload.chainId ? ` on ${getNetworkLabel(payload.chainId)}` : ''}.`,
       `Amount: ${payload.amountEth ?? 'unknown'} ETH`,
       `To: ${payload.to ?? 'unknown'}`,
+      `RPC: ${payload.rpcHost ?? 'unknown'}`,
       `Tx hash: ${payload.transactionHash ?? 'unknown'}`,
     ];
   }
