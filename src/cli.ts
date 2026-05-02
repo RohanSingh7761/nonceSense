@@ -71,6 +71,10 @@ interface ChatContextTurn {
   message: string;
 }
 
+interface PendingSwapConfirmation {
+  flags: Record<string, string>;
+}
+
 interface TokenMetadata {
   symbol: string;
   address: string;
@@ -94,6 +98,16 @@ let tokenListCache:
   | undefined;
 
 const MAX_CONTEXT_TURNS = 12;
+
+function isAffirmative(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return /^(yes|y|confirm|confirmed|proceed|go ahead|do it|execute)\b/.test(normalized);
+}
+
+function isNegative(message: string): boolean {
+  const normalized = message.trim().toLowerCase();
+  return /^(no|n|cancel|stop|don'?t|do not)\b/.test(normalized);
+}
 
 function getNetworkLabel(chainId: number): string {
   if (chainId === 11155111) return 'Sepolia';
@@ -1218,6 +1232,30 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
   return [JSON.stringify(result, null, 2)];
 }
 
+function formatSwapConfirmationLines(
+  quoteResult: unknown,
+  flags: Record<string, string>,
+): string[] {
+  const payload = quoteResult as {
+    tokenIn?: { symbol?: string };
+    tokenOut?: { symbol?: string };
+    amountInFormatted?: string;
+    amountOutFormatted?: string;
+  };
+  const chainId = parseInt(flags.chainId ?? '', 10);
+  const slippageBps = flags.slippageBps ?? '100';
+
+  return [
+    'Before I execute the swap, please confirm these details:',
+    `Network: ${Number.isFinite(chainId) ? getNetworkLabel(chainId) : 'Unknown'}`,
+    `Pair: ${payload.tokenIn?.symbol ?? flags.tokenIn ?? 'TOKEN'} -> ${payload.tokenOut?.symbol ?? flags.tokenOut ?? 'TOKEN'}`,
+    `Amount in: ${payload.amountInFormatted ?? flags.amount ?? flags.amountIn ?? 'unknown'}`,
+    `Estimated amount out: ${payload.amountOutFormatted ?? 'unknown'}`,
+    `Slippage: ${slippageBps} bps`,
+    'Reply with "yes" to proceed or "no" to cancel.',
+  ];
+}
+
 async function runChatMode(): Promise<void> {
   console.log('NonceSense chat mode started. Ask naturally (type "exit" to quit).');
   await logSystemEvent('chat-mode-started', { logsPath: getLogsPath() });
@@ -1245,6 +1283,7 @@ async function runChatMode(): Promise<void> {
   const rl = createInterface({ input, output });
   let lastErrorText: string | undefined;
   let pendingStep: ActionStep | undefined;
+  let pendingSwapConfirmation: PendingSwapConfirmation | undefined;
   try {
     while (true) {
       const message = (await rl.question('You: ')).trim();
@@ -1263,10 +1302,74 @@ async function runChatMode(): Promise<void> {
         continue;
       }
 
+      if (pendingSwapConfirmation) {
+        const confirmation = pendingSwapConfirmation;
+        if (isAffirmative(message)) {
+          try {
+            await logActionEvent('swap-execute', 'started', {
+              source: 'confirmation',
+              chainId: confirmation.flags.chainId ?? 'unknown',
+            });
+            const result = await executeCommand('swap-execute', confirmation.flags);
+            await logActionEvent('swap-execute', 'succeeded', {
+              source: 'confirmation',
+              chainId: confirmation.flags.chainId ?? 'unknown',
+            });
+            lastErrorText = undefined;
+            pendingSwapConfirmation = undefined;
+            await emitAssistantLines(formatChatFriendlyResult('swap-execute', result));
+          } catch (error: unknown) {
+            const text = error instanceof Error ? error.message : String(error);
+            await logActionEvent('swap-execute', 'failed', {
+              source: 'confirmation',
+              chainId: confirmation.flags.chainId ?? 'unknown',
+              error: text,
+            });
+            await logErrorEvent(text, {
+              action: 'swap-execute',
+              source: 'confirmation',
+              chainId: confirmation.flags.chainId ?? 'unknown',
+            });
+            lastErrorText = text;
+            pendingSwapConfirmation = undefined;
+            await emitAssistantLine(text);
+          }
+          continue;
+        }
+
+        if (isNegative(message)) {
+          await logSystemEvent('swap-cancelled-by-user', {
+            chainId: confirmation.flags.chainId ?? 'unknown',
+          });
+          pendingSwapConfirmation = undefined;
+          await emitAssistantLine('Swap cancelled.');
+          continue;
+        }
+
+        await emitAssistantLine('Please reply with "yes" to proceed or "no" to cancel this swap.');
+        continue;
+      }
+
       if (pendingStep) {
         const enriched = enrichPendingStepFromMessage(pendingStep, message);
         const missing = missingDetailsForStep(enriched);
         if (missing.length === 0) {
+          if (enriched.action === 'swap-execute') {
+            try {
+              const quoteResult = await executeCommand('swap-quote', enriched.flags);
+              pendingSwapConfirmation = { flags: { ...enriched.flags } };
+              pendingStep = undefined;
+              await emitAssistantLines(formatSwapConfirmationLines(quoteResult, enriched.flags));
+            } catch (error: unknown) {
+              const text = error instanceof Error ? error.message : String(error);
+              await logErrorEvent(text, { action: 'swap-quote', source: 'swap-confirmation-preview' });
+              lastErrorText = text;
+              pendingStep = undefined;
+              await emitAssistantLine(text);
+            }
+            continue;
+          }
+
           try {
             await logActionEvent(enriched.action, 'started', { source: 'pending-step' });
             const result = await executeCommand(enriched.action, enriched.flags);
@@ -1350,6 +1453,14 @@ async function runChatMode(): Promise<void> {
           if (missing.includes('network')) {
             pendingStep = stepWithNetwork;
             await emitAssistantLine(getNetworkPromptText());
+            break;
+          }
+
+          if (stepWithNetwork.action === 'swap-execute') {
+            const quoteResult = await executeCommand('swap-quote', stepWithNetwork.flags);
+            pendingSwapConfirmation = { flags: { ...stepWithNetwork.flags } };
+            pendingStep = undefined;
+            await emitAssistantLines(formatSwapConfirmationLines(quoteResult, stepWithNetwork.flags));
             break;
           }
 
