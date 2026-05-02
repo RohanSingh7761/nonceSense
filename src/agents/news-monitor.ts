@@ -39,6 +39,7 @@ export interface StartNewsMonitorInput {
 }
 
 const DEFAULT_INTERVAL_MS = 5 * 60 * 1000;
+const BALANCE_CHECK_INTERVAL_MS = 30 * 1000;
 const MAX_ARTICLES_FOR_ANALYSIS = 12;
 
 function getNewsUrl(apiKey: string): string {
@@ -64,6 +65,22 @@ async function fetchEthereumNews(apiKey: string): Promise<NewsArticle[]> {
 
 function articleKey(article: NewsArticle): string {
   return `${article.url ?? ''}|${article.publishedAt ?? ''}|${article.title ?? ''}`;
+}
+
+function hasPositiveWalletBalance(wallet: WalletSnapshot): boolean {
+  for (const network of wallet.networks) {
+    const native = Number(network.nativeEth);
+    if (Number.isFinite(native) && native > 0) {
+      return true;
+    }
+    for (const token of network.tokens) {
+      const amount = Number(token.balance);
+      if (Number.isFinite(amount) && amount > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 async function generateRecommendation(
@@ -120,6 +137,9 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
   const seen = new Set<string>();
   let stopped = false;
   let running = false;
+  let hasFunds = false;
+  let waitingAnnounced = false;
+  let nextAnalysisAt: number | undefined;
 
   const tick = async (): Promise<void> => {
     if (stopped || running) {
@@ -127,6 +147,40 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
     }
     running = true;
     try {
+      const wallet = await input.getWalletSnapshot();
+      const funded = hasPositiveWalletBalance(wallet);
+
+      if (!funded) {
+        hasFunds = false;
+        nextAnalysisAt = undefined;
+        if (!waitingAnnounced) {
+          waitingAnnounced = true;
+          await input.onRecommendation([
+            '[Market Agent] Waiting for wallet balance > 0 before starting news analysis.',
+          ]);
+        }
+        return;
+      }
+
+      if (!hasFunds) {
+        hasFunds = true;
+        waitingAnnounced = false;
+        nextAnalysisAt = Date.now() + intervalMs;
+        await input.onRecommendation([
+          '[Market Agent] Balance detected. First news analysis will run in 5 minutes.',
+        ]);
+        return;
+      }
+
+      if (!nextAnalysisAt) {
+        nextAnalysisAt = Date.now() + intervalMs;
+        return;
+      }
+
+      if (Date.now() < nextAnalysisAt) {
+        return;
+      }
+
       const allArticles = await fetchEthereumNews(apiKey);
       const newest = allArticles
         .slice(0, MAX_ARTICLES_FOR_ANALYSIS)
@@ -140,15 +194,16 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
         });
 
       if (newest.length === 0) {
+        nextAnalysisAt = Date.now() + intervalMs;
         return;
       }
 
-      const wallet = await input.getWalletSnapshot();
       const recommendation = await generateRecommendation(wallet, newest, process.env.GEMINI_API_KEY);
       await input.onRecommendation([
         '[Market Agent] New Ethereum news signal:',
         ...recommendation,
       ]);
+      nextAnalysisAt = Date.now() + intervalMs;
     } catch (error: unknown) {
       const text = error instanceof Error ? error.message : String(error);
       await input.onRecommendation([`[Market Agent] News monitor error: ${text}`]);
@@ -159,7 +214,7 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
 
   const timer = setInterval(() => {
     void tick();
-  }, intervalMs);
+  }, BALANCE_CHECK_INTERVAL_MS);
   void tick();
 
   return () => {
