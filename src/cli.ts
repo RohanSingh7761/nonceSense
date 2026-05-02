@@ -22,12 +22,17 @@ import {
 } from './layers/execution/index.js';
 import {
   addRecommendation,
+  getLogsPath,
   getMemoryPath,
   getRecommendationById,
   listRecentRecommendations,
+  logActionEvent,
+  logChatMessage,
+  logErrorEvent,
   logExecutionFailed,
   logExecutionRequested,
   logExecutionSubmitted,
+  logSystemEvent,
 } from './layers/memory/index.js';
 import { evaluateExecutionPolicy } from './layers/policy/index.js';
 import { evaluateTrigger } from './layers/trigger/index.js';
@@ -61,6 +66,11 @@ interface ActionStep {
   useCurrentNativeBalanceAsAmount?: boolean;
 }
 
+interface ChatContextTurn {
+  role: 'user' | 'assistant';
+  message: string;
+}
+
 interface TokenMetadata {
   symbol: string;
   address: string;
@@ -83,10 +93,43 @@ let tokenListCache:
     }
   | undefined;
 
+const MAX_CONTEXT_TURNS = 12;
+
 function getNetworkLabel(chainId: number): string {
   if (chainId === 11155111) return 'Sepolia';
   if (chainId === 1) return 'Ethereum Mainnet';
   return `Chain ${chainId}`;
+}
+
+function detectChainIdFromText(message: string): number | undefined {
+  const lower = message.toLowerCase();
+  const hasMainnet =
+    /\bmainnet\b/.test(lower) || /\bethereum\b/.test(lower) || /\beth mainnet\b/.test(lower);
+  const hasSepolia = /\bsepolia\b/.test(lower);
+  if (hasMainnet && hasSepolia) {
+    return undefined;
+  }
+  if (hasMainnet) {
+    return 1;
+  }
+  if (hasSepolia) {
+    return 11155111;
+  }
+  return undefined;
+}
+
+function getRpcUrlForChainId(chainId: number): string {
+  if (chainId === 1) {
+    return process.env.ALCHEMY_MAINNET_ENDPOINT ?? '';
+  }
+  if (chainId === 11155111) {
+    return process.env.ALCHEMY_SEPOLIA_ENDPOINT ?? '';
+  }
+  return '';
+}
+
+function getNetworkPromptText(): string {
+  return 'Which network should I use for this action: Sepolia or Ethereum Mainnet?';
 }
 
 function getTokenDirectory(chainId: number): Record<string, TokenMetadata> {
@@ -267,6 +310,9 @@ function humanizeMissingDetails(errorText: string): string {
         return 'recipient wallet address';
       case 'mode':
         return 'mode (recommendation-only / assisted-execution / limited-auto-execution)';
+      case 'network':
+      case 'chainId':
+        return 'network (Sepolia or Ethereum Mainnet)';
       default:
         return item;
     }
@@ -281,10 +327,10 @@ Usage:
   npm run dev
 
 Chat examples:
-  "What is my balance?"
-  "Send 0.001 ETH to 0x..."
-  "Give me quote for swapping 0.007 ETH to USDC"
-  "What is my balance, and if above 0.005 ETH then quote ETH to USDC"
+  "What is my balance on sepolia?"
+  "Send 0.001 ETH to 0x... on mainnet"
+  "Give me quote for swapping 0.007 ETH to USDC on sepolia"
+  "What is my balance, and if above 0.005 ETH then quote ETH to USDC on mainnet"
   "Set mode to assisted execution"
 `);
 }
@@ -299,7 +345,17 @@ async function getActiveUserFromConfig() {
 }
 
 function getDefaultRpcUrl(): string {
-  return process.env.ALCHEMY_SEPOLIA_ENDPOINT ?? '';
+  return process.env.ALCHEMY_SEPOLIA_ENDPOINT ?? process.env.ALCHEMY_MAINNET_ENDPOINT ?? '';
+}
+
+function getDefaultChainId(): number {
+  if (process.env.ALCHEMY_SEPOLIA_ENDPOINT) {
+    return 11155111;
+  }
+  if (process.env.ALCHEMY_MAINNET_ENDPOINT) {
+    return 1;
+  }
+  return 11155111;
 }
 
 async function ensureWalletReady(): Promise<{
@@ -308,7 +364,7 @@ async function ensureWalletReady(): Promise<{
   chainId: number;
   privateKey?: string;
 }> {
-  const chainId = 11155111;
+  const chainId = getDefaultChainId();
   const walletInit = await ensureActiveUserWallet(getDefaultRpcUrl(), chainId);
   const activeUser = walletInit.config.users.find((user) => user.id === walletInit.config.activeUserId);
   if (!activeUser) {
@@ -369,25 +425,54 @@ function parseSwapDetailsFromMessage(message: string): { tokenIn?: string; token
   return {};
 }
 
+function addContextTurn(
+  contextWindow: ChatContextTurn[],
+  role: ChatContextTurn['role'],
+  message: string,
+): void {
+  contextWindow.push({ role, message });
+  if (contextWindow.length > MAX_CONTEXT_TURNS) {
+    contextWindow.splice(0, contextWindow.length - MAX_CONTEXT_TURNS);
+  }
+}
+
 function missingDetailsForStep(step: ActionStep): string[] {
+  const requiresNetwork =
+    step.action === 'wallet-balance' ||
+    step.action === 'wallet-transfer' ||
+    step.action === 'swap-quote' ||
+    step.action === 'swap-execute';
+
+  const missing: string[] = [];
+  if (requiresNetwork && !step.flags.chainId) {
+    missing.push('network');
+  }
+
   if (step.action === 'wallet-transfer') {
-    return ['to', 'amountEth'].filter((key) => !step.flags[key]);
+    missing.push(...['to', 'amountEth'].filter((key) => !step.flags[key]));
+    return missing;
   }
   if (step.action === 'swap-quote' || step.action === 'swap-execute') {
-    const missing: string[] = [];
     if (!step.flags.tokenIn) missing.push('tokenIn');
     if (!step.flags.tokenOut) missing.push('tokenOut');
     if (!step.flags.amount && !step.flags.amountIn && !step.flags.amountEth) missing.push('amount');
     return missing;
   }
   if (step.action === 'mode') {
-    return step.flags.set ? [] : ['mode'];
+    if (!step.flags.set) {
+      missing.push('mode');
+    }
+    return missing;
   }
-  return [];
+  return missing;
 }
 
 function enrichPendingStepFromMessage(step: ActionStep, message: string): ActionStep {
   const enriched: ActionStep = { ...step, flags: { ...step.flags } };
+  const chainId = detectChainIdFromText(message);
+  if (chainId) {
+    enriched.flags.chainId = `${chainId}`;
+  }
   if (step.action === 'wallet-transfer') {
     const extracted = parseTransferFromMessage(message);
     if (!enriched.flags.to && extracted.to) enriched.flags.to = extracted.to;
@@ -415,9 +500,11 @@ function enrichPendingStepFromMessage(step: ActionStep, message: string): Action
 
 function heuristicPlan(message: string): ActionPlan | undefined {
   const lower = message.toLowerCase();
+  const chainId = detectChainIdFromText(message);
+  const networkFlags = chainId ? { chainId: `${chainId}` } : {};
 
   if (/\b(balance|portfolio|funds)\b/.test(lower)) {
-    return { action: 'wallet-balance', flags: {}, reply: 'Checking your balance.' };
+    return { action: 'wallet-balance', flags: networkFlags, reply: 'Checking your balance.' };
   }
 
   const quote = parseSwapDetailsFromMessage(message);
@@ -427,6 +514,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return {
       action: asksSwapExecute ? 'swap-execute' : 'swap-quote',
       flags: {
+        ...networkFlags,
         tokenIn: quote.tokenIn,
         tokenOut: quote.tokenOut,
         amount: quote.amount,
@@ -440,6 +528,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return {
       action: 'wallet-transfer',
       flags: {
+        ...networkFlags,
         ...(parsed.to ? { to: parsed.to } : {}),
         ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
       },
@@ -451,6 +540,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return {
       action: 'swap-quote',
       flags: {
+        ...networkFlags,
         ...(quote.tokenIn ? { tokenIn: quote.tokenIn } : {}),
         ...(quote.tokenOut ? { tokenOut: quote.tokenOut } : {}),
         ...(quote.amount ? { amount: quote.amount } : {}),
@@ -463,6 +553,7 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return {
       action: 'swap-execute',
       flags: {
+        ...networkFlags,
         ...(quote.tokenIn ? { tokenIn: quote.tokenIn } : {}),
         ...(quote.tokenOut ? { tokenOut: quote.tokenOut } : {}),
         ...(quote.amount ? { amount: quote.amount } : {}),
@@ -520,15 +611,20 @@ function explainError(errorText: string): string {
   return `It means the operation failed with: ${errorText}`;
 }
 
-async function buildActionSteps(message: string): Promise<{ steps: ActionStep[]; reply?: string }> {
+async function buildActionSteps(
+  message: string,
+  contextWindow: ChatContextTurn[],
+): Promise<{ steps: ActionStep[]; reply?: string }> {
+  const chainId = detectChainIdFromText(message);
+  const networkFlags = chainId ? { chainId: `${chainId}` } : {};
   const conditional = parseConditionalBalanceQuote(message);
   if (conditional) {
     return {
       steps: [
-        { action: 'wallet-balance', flags: {} },
+        { action: 'wallet-balance', flags: networkFlags },
         {
           action: 'swap-quote',
-          flags: { tokenIn: 'ETH', tokenOut: conditional.tokenOut },
+          flags: { ...networkFlags, tokenIn: 'ETH', tokenOut: conditional.tokenOut },
           minNativeBalanceEth: conditional.thresholdEth,
           useCurrentNativeBalanceAsAmount: true,
         },
@@ -550,7 +646,7 @@ async function buildActionSteps(message: string): Promise<{ steps: ActionStep[];
         continue;
       }
 
-      const plannedSub = await planFromUserMessage(request);
+      const plannedSub = await planFromUserMessage(request, contextWindow);
       if (plannedSub.action !== 'none' && EXECUTABLE_ACTIONS.includes(plannedSub.action)) {
         steps.push({ action: plannedSub.action, flags: plannedSub.flags });
       }
@@ -567,7 +663,7 @@ async function buildActionSteps(message: string): Promise<{ steps: ActionStep[];
     };
   }
 
-  const planned = await planFromUserMessage(message);
+  const planned = await planFromUserMessage(message, contextWindow);
   if (planned.action === 'none' || !EXECUTABLE_ACTIONS.includes(planned.action)) {
     return { steps: [], reply: planned.reply };
   }
@@ -576,7 +672,10 @@ async function buildActionSteps(message: string): Promise<{ steps: ActionStep[];
   };
 }
 
-async function planFromUserMessage(userMessage: string): Promise<ActionPlan> {
+async function planFromUserMessage(
+  userMessage: string,
+  contextWindow: ChatContextTurn[],
+): Promise<ActionPlan> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     return {
@@ -588,6 +687,11 @@ async function planFromUserMessage(userMessage: string): Promise<ActionPlan> {
   }
 
   const ai = new GoogleGenAI({ apiKey });
+  const recentConversation =
+    contextWindow.length > 0
+      ? contextWindow.map((turn) => `${turn.role.toUpperCase()}: ${turn.message}`).join('\n')
+      : 'No prior conversation context.';
+
   const prompt = `You are a router for a chat-first crypto assistant. Convert user chat into one action.
 
 Return STRICT JSON only:
@@ -604,9 +708,14 @@ Rules:
 - If user asks "how/steps" instead of executing, set action=none and explain in reply.
 - For transfers, extract recipient address and ETH amount from natural language.
 - For swap quotes, extract amount + token pair from natural language (example: "0.007 eth with usdc").
+- If user message specifies network, set flags.chainId to "1" for mainnet and "11155111" for sepolia.
+- If network is not specified for balance/transfer/swap actions, do not invent one.
 - If required values are missing, keep action as best guess and include missing details in reply.
 - Never invent addresses/private keys.
 - Keep flags string-to-string.
+
+Recent conversation:
+${recentConversation}
 
 User message:
 ${userMessage}`;
@@ -622,6 +731,39 @@ ${userMessage}`;
     action: parsed.action,
     flags: parsed.flags ?? {},
     reply: parsed.reply ?? 'Working on it.',
+  };
+}
+
+async function getWalletForAction(flags: Record<string, string | boolean>) {
+  await ensureWalletReady();
+  const { activeUser } = await getActiveUserFromConfig();
+  let chainIdRaw = asStringFlag(flags, 'chainId');
+  if (!chainIdRaw) {
+    const network = asStringFlag(flags, 'network');
+    if (network) {
+      const detected = detectChainIdFromText(network);
+      if (detected) {
+        chainIdRaw = `${detected}`;
+      }
+    }
+  }
+  if (!chainIdRaw) {
+    throw new Error('Missing required details: network');
+  }
+  const chainId = parsePositiveInteger(chainIdRaw, 'chainId');
+  if (chainId !== 1 && chainId !== 11155111) {
+    throw new Error('Only Ethereum Mainnet (1) and Sepolia (11155111) are supported right now.');
+  }
+  const rpcUrl = getRpcUrlForChainId(chainId);
+  if (!rpcUrl) {
+    const envName = chainId === 1 ? 'ALCHEMY_MAINNET_ENDPOINT' : 'ALCHEMY_SEPOLIA_ENDPOINT';
+    throw new Error(`RPC URL is missing for ${getNetworkLabel(chainId)}. Add ${envName} in .env.`);
+  }
+
+  return {
+    ...activeUser.wallet,
+    chainId,
+    rpcUrl,
   };
 }
 
@@ -673,35 +815,33 @@ async function executeCommand(
       return { command: 'mode', saved: true, configPath: getConfigPath(), mode: activeUser?.mode };
     }
     case 'wallet-balance': {
-      await ensureWalletReady();
-      const { activeUser } = await getActiveUserFromConfig();
-      const nativeBalance = await getNativeBalance(activeUser.wallet);
-      const portfolio = await getWalletPortfolio(activeUser.wallet);
+      const actionWallet = await getWalletForAction(flags);
+      const nativeBalance = await getNativeBalance(actionWallet);
+      const portfolio = await getWalletPortfolio(actionWallet);
       return {
         command: 'wallet-balance',
-        wallet: activeUser.wallet.address,
-        chainId: activeUser.wallet.chainId,
+        wallet: actionWallet.address,
+        chainId: actionWallet.chainId,
         nativeBalance,
         portfolio,
       };
     }
     case 'wallet-transfer': {
       const values = requireStringFlags(flags, ['to', 'amountEth']);
-      await ensureWalletReady();
-      const { activeUser } = await getActiveUserFromConfig();
+      const actionWallet = await getWalletForAction(flags);
       const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
-      const tx = await transferNative(activeUser.wallet, privateKey, values.to, values.amountEth);
+      const tx = await transferNative(actionWallet, privateKey, values.to, values.amountEth);
       return {
         command: 'wallet-transfer',
-        from: activeUser.wallet.address,
+        from: actionWallet.address,
         to: values.to,
         amountEth: values.amountEth,
+        chainId: actionWallet.chainId,
         transactionHash: tx.transactionHash,
       };
     }
     case 'swap-quote': {
-      await ensureWalletReady();
-      const { activeUser } = await getActiveUserFromConfig();
+      const actionWallet = await getWalletForAction(flags);
       const tokenInInput = asStringFlag(flags, 'tokenIn');
       const tokenOutInput = asStringFlag(flags, 'tokenOut');
       if (!tokenInInput || !tokenOutInput) {
@@ -709,12 +849,12 @@ async function executeCommand(
       }
 
       const tokenIn = await resolveToken(
-        activeUser.wallet.chainId,
+        actionWallet.chainId,
         tokenInInput,
         asStringFlag(flags, 'tokenInDecimals'),
       );
       const tokenOut = await resolveToken(
-        activeUser.wallet.chainId,
+        actionWallet.chainId,
         tokenOutInput,
         asStringFlag(flags, 'tokenOutDecimals'),
       );
@@ -737,7 +877,7 @@ async function executeCommand(
 
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const quote = await quoteExactInputSingle({
-        wallet: activeUser.wallet,
+        wallet: actionWallet,
         tokenIn: tokenIn.address,
         tokenOut: tokenOut.address,
         amountIn: amountRaw,
@@ -754,20 +894,19 @@ async function executeCommand(
       };
     }
     case 'swap-execute': {
-      await ensureWalletReady();
-      const { activeUser } = await getActiveUserFromConfig();
+      const actionWallet = await getWalletForAction(flags);
       const tokenInInput = asStringFlag(flags, 'tokenIn');
       const tokenOutInput = asStringFlag(flags, 'tokenOut');
       if (!tokenInInput || !tokenOutInput) {
         throw new Error('Missing required details: tokenIn, tokenOut');
       }
       const tokenIn = await resolveToken(
-        activeUser.wallet.chainId,
+        actionWallet.chainId,
         tokenInInput,
         asStringFlag(flags, 'tokenInDecimals'),
       );
       const tokenOut = await resolveToken(
-        activeUser.wallet.chainId,
+        actionWallet.chainId,
         tokenOutInput,
         asStringFlag(flags, 'tokenOutDecimals'),
       );
@@ -794,7 +933,7 @@ async function executeCommand(
         'slippageBps',
       );
       const tx = await swapExactInputSingle({
-        wallet: activeUser.wallet,
+        wallet: actionWallet,
         privateKey,
         tokenIn: tokenIn.address,
         tokenOut: tokenOut.address,
@@ -993,7 +1132,7 @@ async function executeCommand(
   }
 }
 
-function printChatFriendlyResult(action: CommandName, result: unknown): void {
+function formatChatFriendlyResult(action: CommandName, result: unknown): string[] {
   if (action === 'setup') {
     const payload = result as {
       walletAddress: string;
@@ -1003,24 +1142,21 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
       note?: string;
     };
     if (payload.autoCreated) {
-      console.log('Assistant: I created your wallet.');
-      console.log(`Assistant: Address: ${payload.walletAddress}`);
+      const lines = ['I created your wallet.', `Address: ${payload.walletAddress}`];
       if (payload.privateKey) {
-        console.log(`Assistant: Private key: ${payload.privateKey}`);
+        lines.push(`Private key: ${payload.privateKey}`);
       }
       if (payload.note) {
-        console.log(`Assistant: ${payload.note}`);
+        lines.push(payload.note);
       }
-      return;
+      return lines;
     }
-    console.log('Assistant: Wallet setup updated.');
-    return;
+    return ['Wallet setup updated.'];
   }
 
   if (action === 'mode') {
     const payload = result as { mode?: string };
-    console.log(`Assistant: Mode set to ${payload.mode ?? 'unknown'}.`);
-    return;
+    return [`Mode set to ${payload.mode ?? 'unknown'}.`];
   }
 
   if (action === 'wallet-balance') {
@@ -1032,17 +1168,29 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
         tokens: Array<{ symbol: string; balanceFormatted: string; contractAddress: string }>;
       };
     };
-    console.log(`Assistant: Wallet ${payload.wallet} on ${getNetworkLabel(payload.chainId)} (chain ${payload.chainId})`);
-    console.log(`Assistant: Native balance: ${payload.portfolio.native.ether}`);
+    const lines = [
+      `Wallet ${payload.wallet} on ${getNetworkLabel(payload.chainId)} (chain ${payload.chainId})`,
+      `Native balance: ${payload.portfolio.native.ether}`,
+    ];
     if (payload.portfolio.tokens.length === 0) {
-      console.log('Assistant: No ERC-20 token balances found via Alchemy.');
-      return;
+      lines.push('No ERC-20 token balances found via Alchemy.');
+      return lines;
     }
-    console.log('Assistant: Token balances:');
+    lines.push('Token balances:');
     for (const token of payload.portfolio.tokens) {
-      console.log(`- ${token.symbol}: ${token.balanceFormatted} (${token.contractAddress})`);
+      lines.push(`- ${token.symbol}: ${token.balanceFormatted} (${token.contractAddress})`);
     }
-    return;
+    return lines;
+  }
+
+  if (action === 'wallet-transfer') {
+    const payload = result as { transactionHash?: string; amountEth?: string; to?: string; chainId?: number };
+    return [
+      `Transfer submitted${payload.chainId ? ` on ${getNetworkLabel(payload.chainId)}` : ''}.`,
+      `Amount: ${payload.amountEth ?? 'unknown'} ETH`,
+      `To: ${payload.to ?? 'unknown'}`,
+      `Tx hash: ${payload.transactionHash ?? 'unknown'}`,
+    ];
   }
 
   if (action === 'swap-quote') {
@@ -1052,32 +1200,43 @@ function printChatFriendlyResult(action: CommandName, result: unknown): void {
       amountInFormatted: string;
       amountOutFormatted: string;
     };
-    console.log(
-      `Assistant: Uniswap V3 quote — ${payload.amountInFormatted} ${payload.tokenIn.symbol} -> ${payload.amountOutFormatted} ${payload.tokenOut.symbol}`,
-    );
-    return;
+    return [
+      `Uniswap V3 quote — ${payload.amountInFormatted} ${payload.tokenIn.symbol} -> ${payload.amountOutFormatted} ${payload.tokenOut.symbol}`,
+    ];
   }
 
   if (action === 'swap-execute') {
     const payload = result as { transactionHash?: string };
     if (payload.transactionHash) {
-      console.log(`Assistant: Swap submitted on Uniswap. Tx hash: ${payload.transactionHash}`);
-      return;
+      return [`Swap submitted on Uniswap. Tx hash: ${payload.transactionHash}`];
     }
   }
 
-  console.log(`Assistant: ${JSON.stringify(result, null, 2)}`);
+  return [JSON.stringify(result, null, 2)];
 }
 
 async function runChatMode(): Promise<void> {
   console.log('NonceSense chat mode started. Ask naturally (type "exit" to quit).');
+  await logSystemEvent('chat-mode-started', { logsPath: getLogsPath() });
   const initialized = await ensureWalletReady();
+  const contextWindow: ChatContextTurn[] = [];
+  const emitAssistantLine = async (line: string): Promise<void> => {
+    console.log(`Assistant: ${line}`);
+    addContextTurn(contextWindow, 'assistant', line);
+    await logChatMessage('assistant', line);
+  };
+  const emitAssistantLines = async (lines: string[]): Promise<void> => {
+    for (const line of lines) {
+      await emitAssistantLine(line);
+    }
+  };
+
   if (initialized.created) {
-    console.log('Assistant: I created a new wallet for you (first-time setup).');
-    console.log(`Assistant: Address: ${initialized.walletAddress}`);
+    await emitAssistantLine('I created a new wallet for you (first-time setup).');
+    await emitAssistantLine(`Address: ${initialized.walletAddress}`);
     if (initialized.privateKey) {
-      console.log(`Assistant: Private key: ${initialized.privateKey}`);
-      console.log('Assistant: Save this private key securely. It is stored locally for chat execution.');
+      await emitAssistantLine(`Private key: ${initialized.privateKey}`);
+      await emitAssistantLine('Save this private key securely. It is stored locally for chat execution.');
     }
   }
   const rl = createInterface({ input, output });
@@ -1089,12 +1248,15 @@ async function runChatMode(): Promise<void> {
       if (!message) {
         continue;
       }
+      await logChatMessage('user', message);
+      addContextTurn(contextWindow, 'user', message);
       if (message.toLowerCase() === 'exit' || message.toLowerCase() === 'quit') {
+        await logSystemEvent('chat-mode-exit');
         break;
       }
 
       if (shouldExplainLastError(message) && lastErrorText) {
-        console.log(`Assistant: ${explainError(lastErrorText)}`);
+        await emitAssistantLine(explainError(lastErrorText));
         continue;
       }
 
@@ -1103,19 +1265,23 @@ async function runChatMode(): Promise<void> {
         const missing = missingDetailsForStep(enriched);
         if (missing.length === 0) {
           try {
+            await logActionEvent(enriched.action, 'started', { source: 'pending-step' });
             const result = await executeCommand(enriched.action, enriched.flags);
+            await logActionEvent(enriched.action, 'succeeded', { source: 'pending-step' });
             lastErrorText = undefined;
             pendingStep = undefined;
-            printChatFriendlyResult(enriched.action, result);
+            await emitAssistantLines(formatChatFriendlyResult(enriched.action, result));
             continue;
           } catch (error: unknown) {
             const text = error instanceof Error ? error.message : String(error);
+            await logActionEvent(enriched.action, 'failed', { source: 'pending-step', error: text });
+            await logErrorEvent(text, { action: enriched.action, source: 'pending-step' });
             lastErrorText = text;
             pendingStep = undefined;
             if (text.startsWith('Missing required details:')) {
-              console.log(`Assistant: ${humanizeMissingDetails(text)}`);
+              await emitAssistantLine(humanizeMissingDetails(text));
             } else {
-              console.log(`Assistant: ${text}`);
+              await emitAssistantLine(text);
             }
             continue;
           }
@@ -1125,70 +1291,97 @@ async function runChatMode(): Promise<void> {
 
       const directAnswer = await directNetworkAnswer(message);
       if (directAnswer) {
-        console.log(`Assistant: ${directAnswer}`);
+        await emitAssistantLine(directAnswer);
         continue;
       }
 
       let built: { steps: ActionStep[]; reply?: string };
       try {
-        built = await buildActionSteps(message);
+        built = await buildActionSteps(message, contextWindow);
       } catch (error: unknown) {
         const text = error instanceof Error ? error.message : String(error);
-        console.log(`Assistant: I could not parse that yet (${text}). Try rephrasing.`);
+        await logErrorEvent(text, { action: 'buildActionSteps' });
+        await emitAssistantLine(`I could not parse that yet (${text}). Try rephrasing.`);
         continue;
       }
 
       if (built.steps.length === 0) {
-        console.log(`Assistant: ${built.reply ?? 'Got it.'}`);
+        await emitAssistantLine(built.reply ?? 'Got it.');
         continue;
       }
 
       let currentNativeBalanceEth: string | undefined;
       for (const step of built.steps) {
+        const stepWithNetwork = enrichPendingStepFromMessage(step, message);
+
         if (step.action === 'wallet-transfer') {
           const extracted = parseTransferFromMessage(message);
-          if (!step.flags.to && extracted.to) {
-            step.flags.to = extracted.to;
+          if (!stepWithNetwork.flags.to && extracted.to) {
+            stepWithNetwork.flags.to = extracted.to;
           }
-          if (!step.flags.amountEth && extracted.amountEth) {
-            step.flags.amountEth = extracted.amountEth;
+          if (!stepWithNetwork.flags.amountEth && extracted.amountEth) {
+            stepWithNetwork.flags.amountEth = extracted.amountEth;
           }
         }
 
-        if (step.useCurrentNativeBalanceAsAmount && currentNativeBalanceEth) {
-          step.flags.amount = currentNativeBalanceEth;
+        if (stepWithNetwork.useCurrentNativeBalanceAsAmount && currentNativeBalanceEth) {
+          stepWithNetwork.flags.amount = currentNativeBalanceEth;
         }
 
-        if (step.minNativeBalanceEth && currentNativeBalanceEth) {
+        if (stepWithNetwork.minNativeBalanceEth && currentNativeBalanceEth) {
           const current = Number(currentNativeBalanceEth);
-          const threshold = Number(step.minNativeBalanceEth);
+          const threshold = Number(stepWithNetwork.minNativeBalanceEth);
           if (Number.isFinite(current) && Number.isFinite(threshold) && current <= threshold) {
-            console.log(
-              `Assistant: Skipping quote because balance ${currentNativeBalanceEth} ETH is not above ${step.minNativeBalanceEth} ETH.`,
+            await emitAssistantLine(
+              `Skipping quote because balance ${currentNativeBalanceEth} ETH is not above ${stepWithNetwork.minNativeBalanceEth} ETH.`,
             );
             continue;
           }
         }
 
         try {
-          const result = await executeCommand(step.action, step.flags);
+          await logActionEvent(stepWithNetwork.action, 'planned', {
+            chainId: stepWithNetwork.flags.chainId ?? 'unspecified',
+          });
+          const missing = missingDetailsForStep(stepWithNetwork);
+          if (missing.includes('network')) {
+            pendingStep = stepWithNetwork;
+            await emitAssistantLine(getNetworkPromptText());
+            break;
+          }
+
+          await logActionEvent(stepWithNetwork.action, 'started', {
+            chainId: stepWithNetwork.flags.chainId ?? 'unknown',
+          });
+          const result = await executeCommand(stepWithNetwork.action, stepWithNetwork.flags);
+          await logActionEvent(stepWithNetwork.action, 'succeeded', {
+            chainId: stepWithNetwork.flags.chainId ?? 'unknown',
+          });
           lastErrorText = undefined;
           pendingStep = undefined;
-          printChatFriendlyResult(step.action, result);
+          await emitAssistantLines(formatChatFriendlyResult(stepWithNetwork.action, result));
 
-          if (step.action === 'wallet-balance') {
+          if (stepWithNetwork.action === 'wallet-balance') {
             const payload = result as { portfolio: { native: { ether: string } } };
             currentNativeBalanceEth = payload.portfolio.native.ether;
           }
         } catch (error: unknown) {
           const text = error instanceof Error ? error.message : String(error);
+          await logActionEvent(stepWithNetwork.action, 'failed', {
+            chainId: stepWithNetwork.flags.chainId ?? 'unknown',
+            error: text,
+          });
+          await logErrorEvent(text, {
+            action: stepWithNetwork.action,
+            chainId: stepWithNetwork.flags.chainId ?? 'unknown',
+          });
           lastErrorText = text;
           if (text.startsWith('Missing required details:')) {
-            pendingStep = step;
-            console.log(`Assistant: ${humanizeMissingDetails(text)}`);
+            pendingStep = stepWithNetwork;
+            await emitAssistantLine(humanizeMissingDetails(text));
           } else {
             pendingStep = undefined;
-            console.log(`Assistant: ${text}`);
+            await emitAssistantLine(text);
           }
         }
       }
@@ -1204,6 +1397,7 @@ async function run(): Promise<void> {
 
 run().catch((error: unknown) => {
   const message = error instanceof Error ? error.message : String(error);
+  void logErrorEvent(message, { source: 'run-catch' });
   console.error(`CLI error: ${message}`);
   process.exitCode = 1;
 });

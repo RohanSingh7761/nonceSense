@@ -110,7 +110,12 @@ async function callJsonRpc<TResponse>(
 
 export async function getWalletPortfolio(walletConfig: WalletConfig): Promise<WalletPortfolio> {
   const native = await getNativeBalance(walletConfig);
-  const endpoint = process.env.ALCHEMY_SEPOLIA_ENDPOINT;
+  const endpoint =
+    walletConfig.chainId === 1
+      ? process.env.ALCHEMY_MAINNET_ENDPOINT
+      : walletConfig.chainId === 11155111
+        ? process.env.ALCHEMY_SEPOLIA_ENDPOINT
+        : undefined;
 
   if (!endpoint) {
     return { native, tokens: [] };
