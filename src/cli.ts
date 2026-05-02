@@ -95,6 +95,8 @@ function getTokenDirectory(chainId: number): Record<string, TokenMetadata> {
       ETH: { symbol: 'WETH', address: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14', decimals: 18 },
       WETH: { symbol: 'WETH', address: '0xfff9976782d46cc05630d1f6ebab18b2324d6b14', decimals: 18 },
       USDC: { symbol: 'USDC', address: '0x1c7d4b196cb0c7b01d743fbc6116a902379c7238', decimals: 6 },
+      DAI: { symbol: 'DAI', address: '0xFF34B3d4Aee8ddCd6F9AFFFB6Fe49bD371b8a357', decimals: 18 },
+      USDT: { symbol: 'USDT', address: '0xaA8E23Fb1079EA71e0a56F48a2aA51851D8433D0', decimals: 6 },
     };
   }
 
@@ -706,12 +708,12 @@ async function executeCommand(
         throw new Error('Missing required details: tokenIn, tokenOut');
       }
 
-      const tokenIn = resolveToken(
+      const tokenIn = await resolveToken(
         activeUser.wallet.chainId,
         tokenInInput,
         asStringFlag(flags, 'tokenInDecimals'),
       );
-      const tokenOut = resolveToken(
+      const tokenOut = await resolveToken(
         activeUser.wallet.chainId,
         tokenOutInput,
         asStringFlag(flags, 'tokenOutDecimals'),
@@ -759,12 +761,12 @@ async function executeCommand(
       if (!tokenInInput || !tokenOutInput) {
         throw new Error('Missing required details: tokenIn, tokenOut');
       }
-      const tokenIn = resolveToken(
+      const tokenIn = await resolveToken(
         activeUser.wallet.chainId,
         tokenInInput,
         asStringFlag(flags, 'tokenInDecimals'),
       );
-      const tokenOut = resolveToken(
+      const tokenOut = await resolveToken(
         activeUser.wallet.chainId,
         tokenOutInput,
         asStringFlag(flags, 'tokenOutDecimals'),
