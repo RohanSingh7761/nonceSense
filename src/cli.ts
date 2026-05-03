@@ -10,11 +10,14 @@ import { stdin as input, stdout as output } from 'node:process';
 
 import {
   ensureActiveUserWallet,
+  decryptActiveUserPrivateKey,
   getActiveUserPrivateKey,
   getConfigPath,
   hasUserProfile,
+  isActiveUserPrivateKeyEncrypted,
   loadConfig,
   loadUserProfile,
+  migrateActiveUserPrivateKeyToEncrypted,
   saveHabitsThreshold,
   saveNewsInterval,
   saveSpendingLimit,
@@ -427,9 +430,34 @@ async function ensureWalletReady(): Promise<{
   walletAddress: string;
   chainId: number;
   privateKey?: string;
+  mnemonicPhrase?: string;
 }> {
   const chainId = getDefaultChainId();
-  const walletInit = await ensureActiveUserWallet(getDefaultRpcUrl(), chainId);
+  const config = await loadConfig();
+  const activeUserPre = config.users.find((user) => user.id === config.activeUserId);
+  const needsWallet = !activeUserPre?.wallet?.address || !activeUserPre?.wallet?.rpcUrl;
+  let walletInit: Awaited<ReturnType<typeof ensureActiveUserWallet>>;
+  if (needsWallet) {
+    const rl = createInterface({ input, output });
+    try {
+      console.log('');
+      console.log(`${UI.bold}Wallet Encryption${UI.reset}`);
+      console.log(`${UI.dim}Set a passphrase to encrypt your private key locally.${UI.reset}`);
+      console.log(`${UI.dim}You will need this passphrase to sign transactions in this workspace.${UI.reset}`);
+      const passphrase = await rl.question(`  ${UI.bold}Encryption passphrase${UI.reset}: `);
+      const confirm = await rl.question(`  ${UI.bold}Confirm passphrase${UI.reset}: `);
+      if (!passphrase || passphrase !== confirm) {
+        throw new Error('Passphrase was empty or did not match confirmation.');
+      }
+      walletInit = await ensureActiveUserWallet(getDefaultRpcUrl(), chainId, {
+        encryptWithPassphrase: passphrase,
+      });
+    } finally {
+      rl.close();
+    }
+  } else {
+    walletInit = await ensureActiveUserWallet(getDefaultRpcUrl(), chainId);
+  }
   const activeUser = walletInit.config.users.find((user) => user.id === walletInit.config.activeUserId);
   if (!activeUser) {
     throw new Error('Active user not found.');
@@ -439,6 +467,7 @@ async function ensureWalletReady(): Promise<{
     walletAddress: activeUser.wallet.address,
     chainId: activeUser.wallet.chainId,
     privateKey: walletInit.privateKey,
+    mnemonicPhrase: walletInit.mnemonicPhrase,
   };
 }
 
@@ -1129,6 +1158,7 @@ async function getWalletForAction(flags: Record<string, string | boolean>) {
 async function executeCommand(
   command: CommandName,
   flags: Record<string, string | boolean>,
+  ctx?: { getPrivateKey?: () => Promise<string> },
 ): Promise<unknown> {
   switch (command) {
     case 'help':
@@ -1188,27 +1218,29 @@ async function executeCommand(
     case 'wallet-transfer': {
       const values = requireStringFlags(flags, ['to', 'amountEth']);
       const actionWallet = await getWalletForAction(flags);
-      const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const recipient = await resolveRecipientAddress(actionWallet, values.to);
       const tokenInput = (asStringFlag(flags, 'token') ?? 'ETH').toUpperCase();
 
-      // --- Spending limit check ---
+      // --- Spending limit check (OS password only — before unlocking signing key) ---
       const config = await loadConfig();
       const activeUser = config.users.find((u) => u.id === config.activeUserId);
       const maxAutoApproveEth = activeUser?.policy?.maxAutoApproveEth ?? 0;
       const amountNum = parseFloat(values.amountEth);
       if (maxAutoApproveEth > 0 && amountNum > maxAutoApproveEth) {
-        // Amount exceeds the auto-approve limit — require OS password
         const approved = await requireOsPasswordApproval(
-          `Authorize transfer of ${values.amountEth} ETH to ${values.to}?\nThis exceeds your auto-approve limit of ${maxAutoApproveEth} ETH.`,
+          `Authorize transfer of ${values.amountEth} ${tokenInput} to ${values.to}?\nThis exceeds your auto-approve limit of ${maxAutoApproveEth} ETH-equivalent.`,
         );
         if (!approved) {
           throw new Error(
-            `Transfer of ${values.amountEth} ETH requires authorization. Cancelled because OS password was not confirmed.`,
+            `Transfer of ${values.amountEth} ${tokenInput} requires authorization. Cancelled because OS password was not confirmed.`,
           );
         }
       }
       // ----------------------------
+
+      const privateKey = ctx?.getPrivateKey
+        ? await ctx.getPrivateKey()
+        : (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
 
       if (tokenInput === 'ETH') {
         const tx = await transferNative(actionWallet, privateKey, recipient.resolvedAddress, values.amountEth);
@@ -1326,6 +1358,10 @@ async function executeCommand(
         asStringFlag(flags, 'tokenOutDecimals'),
       );
 
+      const amountHumanForLimit =
+        asStringFlag(flags, 'amount') ??
+        asStringFlag(flags, 'amountEth') ??
+        undefined;
       const amountRaw =
         asStringFlag(flags, 'amountIn') ??
         (() => {
@@ -1341,7 +1377,31 @@ async function executeCommand(
         throw new Error('Missing required details: amount');
       }
 
-      const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
+      const symIn = tokenInInput.toUpperCase();
+      const swapConfig = await loadConfig();
+      const swapUser = swapConfig.users.find((u) => u.id === swapConfig.activeUserId);
+      const maxEthSwap = swapUser?.policy?.maxAutoApproveEth ?? 0;
+      if (
+        maxEthSwap > 0 &&
+        amountHumanForLimit &&
+        (symIn === 'ETH' || symIn === 'WETH')
+      ) {
+        const swapAmountNum = parseFloat(amountHumanForLimit);
+        if (Number.isFinite(swapAmountNum) && swapAmountNum > maxEthSwap) {
+          const approved = await requireOsPasswordApproval(
+            `Authorize swap of ${amountHumanForLimit} ${symIn} -> ${tokenOutInput}?\nThis exceeds your auto-approve limit of ${maxEthSwap} ETH-equivalent.`,
+          );
+          if (!approved) {
+            throw new Error(
+              `Swap requires authorization. Cancelled because OS password was not confirmed.`,
+            );
+          }
+        }
+      }
+
+      const privateKey = ctx?.getPrivateKey
+        ? await ctx.getPrivateKey()
+        : (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const slippageBps = parsePositiveInteger(
         asStringFlag(flags, 'slippageBps') ?? '100',
@@ -1431,7 +1491,9 @@ async function executeCommand(
         throw new Error(message);
       }
 
-      const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
+      const privateKey = ctx?.getPrivateKey
+        ? await ctx.getPrivateKey()
+        : (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const fee = parsePositiveInteger(asStringFlag(flags, 'fee') ?? '3000', 'fee');
       const slippageBps = parsePositiveInteger(
         asStringFlag(flags, 'slippageBps') ?? `${recommendation.request.slippageBps}`,
@@ -1558,11 +1620,16 @@ function formatChatFriendlyResult(action: CommandName, result: unknown): string[
       walletAddress: string;
       chainId: number;
       privateKey?: string;
+      mnemonicPhrase?: string;
       autoCreated?: boolean;
       note?: string;
     };
     if (payload.autoCreated) {
       const lines = ['I created your wallet.', `Address: ${payload.walletAddress}`];
+      if (payload.mnemonicPhrase) {
+        lines.push(`Mnemonic phrase: ${payload.mnemonicPhrase}`);
+        lines.push('Write this mnemonic phrase down now. It will NOT be stored locally.');
+      }
       if (payload.privateKey) {
         lines.push(`Private key: ${payload.privateKey}`);
       }
@@ -1824,6 +1891,10 @@ async function runChatMode(): Promise<void> {
   if (initialized.created) {
     await emitAssistantLine('I created a new wallet for you (first-time setup).');
     await emitAssistantLine(`Address: ${initialized.walletAddress}`);
+    if (initialized.mnemonicPhrase) {
+      await emitAssistantLine(`Mnemonic phrase: ${initialized.mnemonicPhrase}`);
+      await emitAssistantLine('Write this mnemonic phrase down now. It will NOT be stored locally.');
+    }
     if (initialized.privateKey) {
       await emitAssistantLine(`Private key: ${initialized.privateKey}`);
       await emitAssistantLine('Save this private key securely. It is stored locally for chat execution.');
@@ -1875,9 +1946,56 @@ async function runChatMode(): Promise<void> {
   }
 
   const rl = createInterface({ input, output });
+  let unlockedPrivateKey: string | undefined;
+  let privateKeyUnlockPromise: Promise<string> | undefined;
+
+  const unlockPrivateKeyIfNeeded = async (): Promise<string> => {
+    if (unlockedPrivateKey) {
+      return unlockedPrivateKey;
+    }
+    privateKeyUnlockPromise ??= (async (): Promise<string> => {
+      try {
+        const encrypted = await isActiveUserPrivateKeyEncrypted();
+        if (!encrypted) {
+          const legacy = (await getActiveUserPrivateKey()) ?? '';
+          if (!legacy) {
+            const envKey = process.env.PRIVATE_KEY ?? '';
+            if (!envKey) {
+              throw new Error('Private key not found.');
+            }
+            unlockedPrivateKey = envKey;
+            return unlockedPrivateKey;
+          }
+          const passphrase = await rl.question(
+            `${UI.dim}[unlock] Enter a passphrase to encrypt your private key: ${UI.reset}`,
+          );
+          if (!passphrase) {
+            throw new Error('Missing passphrase.');
+          }
+          await migrateActiveUserPrivateKeyToEncrypted(passphrase);
+          unlockedPrivateKey = await decryptActiveUserPrivateKey(passphrase);
+          return unlockedPrivateKey;
+        }
+
+        const passphrase = await rl.question(
+          `${UI.dim}[unlock] Enter encryption passphrase (once per session): ${UI.reset}`,
+        );
+        if (!passphrase) {
+          throw new Error('Missing passphrase.');
+        }
+        unlockedPrivateKey = await decryptActiveUserPrivateKey(passphrase);
+        return unlockedPrivateKey;
+      } catch (err) {
+        privateKeyUnlockPromise = undefined;
+        throw err;
+      }
+    })();
+    return privateKeyUnlockPromise;
+  };
   let lastErrorText: string | undefined;
   let pendingStep: ActionStep | undefined;
   let pendingSwapConfirmation: PendingSwapConfirmation | undefined;
+  const commandCtx = { getPrivateKey: unlockPrivateKeyIfNeeded };
   try {
     while (true) {
       const rawInput = (await rl.question(`${UI.dim}> ${UI.reset}`)).trim();
@@ -1949,7 +2067,7 @@ async function runChatMode(): Promise<void> {
               source: 'confirmation',
               chainId: confirmation.flags.chainId ?? 'unknown',
             });
-            const result = await executeCommand('swap-execute', confirmation.flags);
+            const result = await executeCommand('swap-execute', confirmation.flags, commandCtx);
             await logActionEvent('swap-execute', 'succeeded', {
               source: 'confirmation',
               chainId: confirmation.flags.chainId ?? 'unknown',
@@ -1995,7 +2113,7 @@ async function runChatMode(): Promise<void> {
         if (missing.length === 0) {
           if (enriched.action === 'swap-execute') {
             try {
-              const quoteResult = await executeCommand('swap-quote', enriched.flags);
+              const quoteResult = await executeCommand('swap-quote', enriched.flags, commandCtx);
               pendingSwapConfirmation = { flags: { ...enriched.flags } };
               pendingStep = undefined;
               await emitAssistantLines(formatSwapConfirmationLines(quoteResult, enriched.flags));
@@ -2011,7 +2129,7 @@ async function runChatMode(): Promise<void> {
 
           try {
             await logActionEvent(enriched.action, 'started', { source: 'pending-step' });
-            const result = await executeCommand(enriched.action, enriched.flags);
+            const result = await executeCommand(enriched.action, enriched.flags, commandCtx);
             await logActionEvent(enriched.action, 'succeeded', { source: 'pending-step' });
             lastErrorText = undefined;
             pendingStep = undefined;
@@ -2105,7 +2223,7 @@ async function runChatMode(): Promise<void> {
           }
 
           if (stepWithNetwork.action === 'swap-execute') {
-            const quoteResult = await executeCommand('swap-quote', stepWithNetwork.flags);
+            const quoteResult = await executeCommand('swap-quote', stepWithNetwork.flags, commandCtx);
             pendingSwapConfirmation = { flags: { ...stepWithNetwork.flags } };
             pendingStep = undefined;
             await emitAssistantLines(formatSwapConfirmationLines(quoteResult, stepWithNetwork.flags));
@@ -2115,7 +2233,7 @@ async function runChatMode(): Promise<void> {
           await logActionEvent(stepWithNetwork.action, 'started', {
             chainId: stepWithNetwork.flags.chainId ?? 'unknown',
           });
-          const result = await executeCommand(stepWithNetwork.action, stepWithNetwork.flags);
+          const result = await executeCommand(stepWithNetwork.action, stepWithNetwork.flags, commandCtx);
           await logActionEvent(stepWithNetwork.action, 'succeeded', {
             chainId: stepWithNetwork.flags.chainId ?? 'unknown',
           });

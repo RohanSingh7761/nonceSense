@@ -1,6 +1,7 @@
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { ethers } from 'ethers';
 
 import type { AppConfig, UserMode } from '../types/index.js';
@@ -12,7 +13,16 @@ const USER_PROFILE_FILE_PATH = path.join(CONFIG_DIRECTORY, 'user-profile.txt');
 const DEFAULT_USER_ID = 'default-user';
 
 interface SecretsStore {
-  userPrivateKeys: Record<string, string>;
+  userPrivateKeys: Record<string, string | EncryptedSecret>;
+}
+
+interface EncryptedSecret {
+  kdf: 'scrypt';
+  cipher: 'aes-256-gcm';
+  saltB64: string;
+  ivB64: string;
+  tagB64: string;
+  ciphertextB64: string;
 }
 
 function getDefaultConfig(): AppConfig {
@@ -71,6 +81,39 @@ function getDefaultSecrets(): SecretsStore {
   };
 }
 
+function deriveKey(passphrase: string, salt: Buffer): Buffer {
+  return crypto.scryptSync(passphrase, salt, 32);
+}
+
+function encryptSecret(plaintext: string, passphrase: string): EncryptedSecret {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const key = deriveKey(passphrase, salt);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    kdf: 'scrypt',
+    cipher: 'aes-256-gcm',
+    saltB64: salt.toString('base64'),
+    ivB64: iv.toString('base64'),
+    tagB64: tag.toString('base64'),
+    ciphertextB64: ciphertext.toString('base64'),
+  };
+}
+
+function decryptSecret(secret: EncryptedSecret, passphrase: string): string {
+  const salt = Buffer.from(secret.saltB64, 'base64');
+  const iv = Buffer.from(secret.ivB64, 'base64');
+  const tag = Buffer.from(secret.tagB64, 'base64');
+  const ciphertext = Buffer.from(secret.ciphertextB64, 'base64');
+  const key = deriveKey(passphrase, salt);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  return plaintext.toString('utf8');
+}
+
 async function ensureSecretsExists(): Promise<void> {
   await mkdir(CONFIG_DIRECTORY, { recursive: true });
   try {
@@ -124,9 +167,14 @@ export interface WalletInitializationResult {
   config: AppConfig;
   created: boolean;
   privateKey?: string;
+  mnemonicPhrase?: string;
 }
 
-export async function ensureActiveUserWallet(defaultRpcUrl: string, defaultChainId = 11155111): Promise<WalletInitializationResult> {
+export async function ensureActiveUserWallet(
+  defaultRpcUrl: string,
+  defaultChainId = 11155111,
+  opts?: { encryptWithPassphrase?: string },
+): Promise<WalletInitializationResult> {
   const config = await loadConfig();
   const secrets = await loadSecrets();
   const activeUser = getOrCreateActiveUser(config);
@@ -136,15 +184,21 @@ export async function ensureActiveUserWallet(defaultRpcUrl: string, defaultChain
     return {
       config,
       created: false,
-      privateKey: savedKey,
+      privateKey: typeof savedKey === 'string' ? savedKey : undefined,
     };
+  }
+
+  if (!opts?.encryptWithPassphrase) {
+    throw new Error(
+      'Wallet creation requires an encryption passphrase (missing encryptWithPassphrase).',
+    );
   }
 
   const wallet = ethers.Wallet.createRandom();
   activeUser.wallet.address = wallet.address;
   activeUser.wallet.rpcUrl = defaultRpcUrl;
   activeUser.wallet.chainId = defaultChainId;
-  secrets.userPrivateKeys[activeUser.id] = wallet.privateKey;
+  secrets.userPrivateKeys[activeUser.id] = encryptSecret(wallet.privateKey, opts.encryptWithPassphrase);
 
   await saveConfig(config);
   await saveSecrets(secrets);
@@ -153,6 +207,7 @@ export async function ensureActiveUserWallet(defaultRpcUrl: string, defaultChain
     config,
     created: true,
     privateKey: wallet.privateKey,
+    mnemonicPhrase: wallet.mnemonic?.phrase,
   };
 }
 
@@ -160,7 +215,47 @@ export async function getActiveUserPrivateKey(): Promise<string | undefined> {
   const config = await loadConfig();
   const secrets = await loadSecrets();
   const activeUser = getOrCreateActiveUser(config);
-  return secrets.userPrivateKeys[activeUser.id];
+  const stored = secrets.userPrivateKeys[activeUser.id];
+  return typeof stored === 'string' ? stored : undefined;
+}
+
+export async function isActiveUserPrivateKeyEncrypted(): Promise<boolean> {
+  const config = await loadConfig();
+  const secrets = await loadSecrets();
+  const activeUser = getOrCreateActiveUser(config);
+  const stored = secrets.userPrivateKeys[activeUser.id];
+  return typeof stored === 'object' && stored !== null;
+}
+
+export async function migrateActiveUserPrivateKeyToEncrypted(passphrase: string): Promise<boolean> {
+  const config = await loadConfig();
+  const secrets = await loadSecrets();
+  const activeUser = getOrCreateActiveUser(config);
+  const stored = secrets.userPrivateKeys[activeUser.id];
+  if (!stored || typeof stored !== 'string') {
+    return false;
+  }
+  secrets.userPrivateKeys[activeUser.id] = encryptSecret(stored, passphrase);
+  await saveSecrets(secrets);
+  return true;
+}
+
+export async function decryptActiveUserPrivateKey(passphrase: string): Promise<string> {
+  const config = await loadConfig();
+  const secrets = await loadSecrets();
+  const activeUser = getOrCreateActiveUser(config);
+  const stored = secrets.userPrivateKeys[activeUser.id];
+  if (!stored) {
+    throw new Error('No private key found for active user.');
+  }
+  if (typeof stored === 'string') {
+    // Legacy plaintext or external override.
+    return stored;
+  }
+  if (stored.kdf !== 'scrypt' || stored.cipher !== 'aes-256-gcm') {
+    throw new Error('Unsupported secret format.');
+  }
+  return decryptSecret(stored, passphrase);
 }
 
 export async function saveNewsInterval(intervalMs: number): Promise<void> {
