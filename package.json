@@ -3,7 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "bin": {
-    "ns": "./bin/ns.js"
+    "ns": "./bin/ns.js",
+    "noncesense": "./bin/ns.js"
   },
   "main": "dist/cli.js",
   "scripts": {
@@ -18,6 +19,10 @@
   "author": "",
   "license": "ISC",
   "description": "",
+  "files": [
+    "dist",
+    "bin"
+  ],
   "dependencies": {
     "@0gfoundation/0g-ts-sdk": "^1.2.8",
     "@google/genai": "^1.51.0",
