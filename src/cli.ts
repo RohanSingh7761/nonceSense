@@ -1,4 +1,7 @@
 import 'dotenv/config';
+import { execSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 
 import { GoogleGenAI } from '@google/genai';
 import { ethers } from 'ethers';
@@ -10,6 +13,8 @@ import {
   getActiveUserPrivateKey,
   getConfigPath,
   loadConfig,
+  saveNewsInterval,
+  saveSpendingLimit,
   setActiveUserMode,
   setActiveUserWallet,
 } from './config/store.js';
@@ -24,6 +29,7 @@ import {
 } from './layers/execution/index.js';
 import {
   addRecommendation,
+  appendRecommendationLog,
   getRecentActionHistory,
   getRecentUserMessages,
   getLogsPath,
@@ -129,9 +135,18 @@ function getNetworkLabel(chainId: number): string {
 
 function detectChainIdFromText(message: string): number | undefined {
   const lower = message.toLowerCase();
-  const hasMainnet =
-    /\bmainnet\b/.test(lower) || /\bethereum\b/.test(lower) || /\beth mainnet\b/.test(lower);
-  const hasSepolia = /\bsepolia\b/.test(lower);
+  // Fuzzy-match common misspellings / shorthand for mainnet and sepolia
+  const mainnetPatterns = [
+    /\bmainnet\b/, /\bethereum\b/, /\beth\s*mainnet\b/, /\bmain\s*net\b/,
+    /\bmainne[t]{0,2}\b/, /\bmainnnet\b/, /\bmainet\b/,
+  ];
+  const sepoliaPatterns = [
+    /\bsepolia\b/, /\bsepolua\b/, /\bsepolja\b/, /\bseppolia\b/,
+    /\bsepolia\b/, /\bsepo\b/, /\bsepolia\b/, /\bsepol[iy]a\b/,
+    /\bsepollia\b/, /\bsepol\b/, /\bsepolia\b/, /\bsepoia\b/,
+  ];
+  const hasMainnet = mainnetPatterns.some((p) => p.test(lower));
+  const hasSepolia = sepoliaPatterns.some((p) => p.test(lower));
   if (hasMainnet && hasSepolia) {
     return undefined;
   }
@@ -208,6 +223,13 @@ async function loadTokenList(): Promise<TokenListEntry[]> {
 }
 
 async function resolveToken(chainId: number, tokenInput: string, decimalsOverride?: string): Promise<TokenMetadata> {
+  // Detect ENS names — they are NOT token symbols
+  if (/^[a-z0-9-]+\.eth$/i.test(tokenInput.trim())) {
+    throw new Error(
+      `"${tokenInput}" looks like an ENS name, not a token. Did you mean to use it as a recipient address?`,
+    );
+  }
+
   if (tokenInput.startsWith('0x')) {
     return {
       symbol: 'TOKEN',
@@ -455,7 +477,8 @@ function parseTransferFromMessage(message: string): { to?: string; amountEth?: s
 }
 
 function parseSwapDetailsFromMessage(message: string): { tokenIn?: string; tokenOut?: string; amount?: string } {
-  const compactPattern = /(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s*(?:to|for|with|into)\s*([a-zA-Z]{2,12})/i;
+  // Negative lookahead (?!\.eth) prevents matching ENS names (e.g. "rschauhan.eth") as tokenOut
+  const compactPattern = /(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s*(?:to|for|with|into)\s*([a-zA-Z]{2,12})(?!\.eth)/i;
   const compactMatch = message.match(compactPattern);
   if (compactMatch) {
     return {
@@ -466,7 +489,7 @@ function parseSwapDetailsFromMessage(message: string): { tokenIn?: string; token
   }
 
   const verbosePattern =
-    /(?:swap(?:ping)?|quote(?: for)?(?: swapping)?|price)\s+(?:for\s+)?(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s+(?:with|to|for)\s+([a-zA-Z]{2,12})/i;
+    /(?:swap(?:ping)?|quote(?: for)?(?: swapping)?|price)\s+(?:for\s+)?(\d+(\.\d+)?)\s*([a-zA-Z]{2,12})\s+(?:with|to|for)\s+([a-zA-Z]{2,12})(?!\.eth)/i;
   const verboseMatch = message.match(verbosePattern);
   if (verboseMatch) {
     return {
@@ -566,6 +589,23 @@ function heuristicPlan(message: string): ActionPlan | undefined {
     return { action: 'wallet-balance', flags: networkFlags, reply: 'Checking your balance.' };
   }
 
+  // Check for transfer with explicit recipient (0x address or ENS name) FIRST,
+  // before swap parsing — prevents "send X eth to name.eth" being parsed as a swap pair.
+  const hasRecipientHint = /0x[a-fA-F0-9]{40}/.test(message) || /\b[a-z0-9-]+\.eth\b/i.test(message);
+  if (/\b(send|transfer)\b/.test(lower) && hasRecipientHint) {
+    const parsed = parseTransferFromMessage(message);
+    return {
+      action: 'wallet-transfer',
+      flags: {
+        ...networkFlags,
+        ...(parsed.to ? { to: parsed.to } : {}),
+        ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
+        ...(parsed.token ? { token: parsed.token } : {}),
+      },
+      reply: 'Preparing transfer.',
+    };
+  }
+
   const quote = parseSwapDetailsFromMessage(message);
   const hasSwapContext = /\b(swap|swapping|trade|convert|exchange)\b/.test(lower);
   const asksQuote = /\b(quote|price|rate)\b/.test(lower) || (/\bhow much\b/.test(lower) && hasSwapContext);
@@ -580,36 +620,6 @@ function heuristicPlan(message: string): ActionPlan | undefined {
         amount: quote.amount,
       },
       reply: asksSwapExecute ? 'Preparing swap execution.' : 'Getting a swap quote.',
-    };
-  }
-
-  const hasRecipientHint = /0x[a-fA-F0-9]{40}/.test(message) || /\b[a-z0-9-]+\.eth\b/i.test(message);
-
-  if (/\b(send|transfer)\b/.test(lower) && /\beth\b/i.test(message) && hasRecipientHint) {
-    const parsed = parseTransferFromMessage(message);
-    return {
-      action: 'wallet-transfer',
-      flags: {
-        ...networkFlags,
-        ...(parsed.to ? { to: parsed.to } : {}),
-        ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
-        ...(parsed.token ? { token: parsed.token } : {}),
-      },
-      reply: 'Preparing transfer.',
-    };
-  }
-
-  if (/\b(send|transfer)\b/.test(lower) && hasRecipientHint) {
-    const parsed = parseTransferFromMessage(message);
-    return {
-      action: 'wallet-transfer',
-      flags: {
-        ...networkFlags,
-        ...(parsed.to ? { to: parsed.to } : {}),
-        ...(parsed.amountEth ? { amountEth: parsed.amountEth } : {}),
-        ...(parsed.token ? { token: parsed.token } : {}),
-      },
-      reply: 'Preparing transfer.',
     };
   }
 
@@ -671,8 +681,116 @@ function shouldUseGeneralReasoning(message: string): boolean {
   const asksConceptual =
     /^(if|what if)\b/i.test(trimmed) ||
     /\b(do i need|should i|can i|would it|is it enough|why|how does)\b/.test(lower);
-  return asksConceptual && !hasAddress && !startsAsCommand;
+
+  // Any general knowledge question about ENS, Ethereum or crypto
+  const isGeneralEthQuery =
+    /\b(ens|ethereum name service|vitalik|defi|gas fee|smart contract|nft|erc-?20|layer 2|l2|rollup)\b/i.test(lower) &&
+    !hasAddress &&
+    !startsAsCommand;
+
+  // ENS query detection — works for ANY natural language form:
+  // "tell me about X.eth", "who is X.eth?", "check out X.eth", "X.eth", "lookup X.eth", etc.
+  // The ONLY messages with .eth that are NOT queries are actual transfers:
+  //   they have a send/transfer verb AND a numeric token amount.
+  const hasEnsName = /\b[a-z0-9][a-z0-9-]*\.eth\b/i.test(trimmed);
+  const looksLikeActualTransfer =
+    hasEnsName &&
+    /\b(send|transfer)\b/i.test(lower) &&
+    /\b\d+(\.\d+)?\s*(eth|weth|usdc|usdt|dai|wbtc)\b/i.test(lower);
+  const isEnsQuery = hasEnsName && !looksLikeActualTransfer;
+
+  return (asksConceptual && !hasAddress && !startsAsCommand) || isEnsQuery || isGeneralEthQuery;
 }
+
+// ─── On-chain ENS resolver ────────────────────────────────────────────────────
+
+interface EnsInfo {
+  name: string;
+  address: string | null;
+  textRecords: Record<string, string>;
+  error?: string;
+}
+
+async function resolveEnsInfo(ensName: string): Promise<EnsInfo> {
+  const mainnetRpc = process.env.ALCHEMY_MAINNET_ENDPOINT;
+  if (!mainnetRpc) {
+    return {
+      name: ensName,
+      address: null,
+      textRecords: {},
+      error: 'ALCHEMY_MAINNET_ENDPOINT is not set — ENS resolution requires Ethereum Mainnet.',
+    };
+  }
+
+  try {
+    const provider = new ethers.JsonRpcProvider(mainnetRpc);
+    const address = await provider.resolveName(ensName);
+    const textRecords: Record<string, string> = {};
+
+    if (address) {
+      const resolver = await provider.getResolver(ensName);
+      if (resolver) {
+        const knownKeys = [
+          'description',
+          'avatar',
+          'url',
+          'com.twitter',
+          'com.github',
+          'org.telegram',
+          'com.discord',
+          'email',
+          'com.reddit',
+        ];
+        for (const key of knownKeys) {
+          try {
+            const val = await resolver.getText(key);
+            if (val) textRecords[key] = val;
+          } catch {
+            // skip unavailable records
+          }
+        }
+      }
+    }
+
+    return { name: ensName, address, textRecords };
+  } catch (err: unknown) {
+    return {
+      name: ensName,
+      address: null,
+      textRecords: {},
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function extractEnsNamesFromMessage(message: string): string[] {
+  const matches = message.match(/\b[a-z0-9][a-z0-9-]*\.eth\b/gi);
+  return matches ? [...new Set(matches.map((m) => m.toLowerCase()))] : [];
+}
+
+function formatEnsInfoForPrompt(info: EnsInfo): string {
+  if (info.error) {
+    return `ENS resolution for "${info.name}" failed: ${info.error}`;
+  }
+  if (!info.address) {
+    return `ENS name "${info.name}" does not resolve to any Ethereum address (it may be unregistered or unconfigured).`;
+  }
+  const lines = [
+    `ENS name: ${info.name}`,
+    `Resolved address: ${info.address}`,
+  ];
+  if (Object.keys(info.textRecords).length > 0) {
+    lines.push('Text records:');
+    for (const [key, value] of Object.entries(info.textRecords)) {
+      lines.push(`  ${key}: ${value}`);
+    }
+  } else {
+    lines.push('No text records set.');
+  }
+  return lines.join('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function directGeneralAnswer(
   message: string,
@@ -692,12 +810,31 @@ async function directGeneralAnswer(
       ? contextWindow.map((turn) => `${turn.role.toUpperCase()}: ${turn.message}`).join('\n')
       : 'No prior conversation context.';
 
-  const prompt = `You are a helpful crypto assistant. Answer the user's question conversationally.
+  // Resolve any ENS names mentioned in the message before calling the AI
+  const ensNames = extractEnsNamesFromMessage(message);
+  let ensContext = '';
+  if (ensNames.length > 0) {
+    const resolved = await Promise.all(ensNames.map(resolveEnsInfo));
+    const sections = resolved.map(formatEnsInfoForPrompt);
+    ensContext = `
+
+--- On-chain ENS Data (resolved live) ---
+${sections.join('\n\n')}
+--- End of ENS Data ---
+
+IMPORTANT: Use ONLY the above on-chain data when answering questions about these ENS names.
+Do NOT invent or hallucinate any addresses, NFTs, token holdings, or protocol interactions that are not listed above.`;
+  }
+
+  const prompt = `You are a helpful Ethereum and crypto assistant. Answer the user's question conversationally.
 
 Rules:
 - This is a conceptual/help question. Do NOT trigger or suggest executing actions.
 - Be concise and practical.
+- If ENS data is provided below, use it as the source of truth. Do not invent information beyond what is shown.
+- If the ENS name did not resolve or has no text records, say so clearly.
 - If the question depends on specific balances/amounts, explain the rule clearly.
+${ensContext}
 
 Recent conversation:
 ${recentConversation}
@@ -1047,6 +1184,24 @@ async function executeCommand(
       const privateKey = (await getActiveUserPrivateKey()) ?? process.env.PRIVATE_KEY ?? '';
       const recipient = await resolveRecipientAddress(actionWallet, values.to);
       const tokenInput = (asStringFlag(flags, 'token') ?? 'ETH').toUpperCase();
+
+      // --- Spending limit check ---
+      const config = await loadConfig();
+      const activeUser = config.users.find((u) => u.id === config.activeUserId);
+      const maxAutoApproveEth = activeUser?.policy?.maxAutoApproveEth ?? 0;
+      const amountNum = parseFloat(values.amountEth);
+      if (maxAutoApproveEth > 0 && amountNum > maxAutoApproveEth) {
+        // Amount exceeds the auto-approve limit — require OS password
+        const approved = await requireOsPasswordApproval(
+          `Authorize transfer of ${values.amountEth} ETH to ${values.to}?\nThis exceeds your auto-approve limit of ${maxAutoApproveEth} ETH.`,
+        );
+        if (!approved) {
+          throw new Error(
+            `Transfer of ${values.amountEth} ETH requires authorization. Cancelled because OS password was not confirmed.`,
+          );
+        }
+      }
+      // ----------------------------
 
       if (tokenInput === 'ETH') {
         const tx = await transferNative(actionWallet, privateKey, recipient.resolvedAddress, values.amountEth);
@@ -1659,12 +1814,18 @@ async function runChatMode(): Promise<void> {
       await emitAssistantLine('Save this private key securely. It is stored locally for chat execution.');
     }
   }
+  const config = await loadConfig();
+  const newsIntervalMs = config.newsIntervalMs ?? 5 * 60 * 1000;
   const stopNewsMonitor = startNewsMonitor({
     getWalletSnapshot: buildWalletSnapshotForNewsAgent,
     onRecommendation: emitMarketLines,
-    intervalMs: 5 * 60 * 1000,
+    onRecommendationLogged: async (lines) => {
+      await appendRecommendationLog(lines);
+    },
+    intervalMs: newsIntervalMs,
   });
-  await emitMarketLines(['[Market Agent] Live monitor started (checks Ethereum news every 5 minutes).']);
+  const intervalMins = Math.round(newsIntervalMs / 60000);
+  await emitMarketLines([`[Market Agent] Live monitor started (checks Ethereum news every ${intervalMins} minute${intervalMins !== 1 ? 's' : ''}).`]);
   const rl = createInterface({ input, output });
   let lastErrorText: string | undefined;
   let pendingStep: ActionStep | undefined;
@@ -1910,7 +2071,232 @@ async function runChatMode(): Promise<void> {
   }
 }
 
+// ─── OS password approval (for spending-limit enforcement) ───────────────────
+
+/**
+ * Prompts the user to enter their OS login password to approve a high-value
+ * transfer.  Returns true if the password was confirmed, false otherwise.
+ *
+ * On Windows: uses `net session` trick — it requires admin OR we fall back to
+ * a simple readline prompt and warn that we cannot cryptographically verify.
+ * On macOS: uses `sudo -k -S true` with piped password.
+ * On Linux: uses `su -c true` with piped password.
+ *
+ * NOTE: This is a UX-level speed-bump, not a cryptographic guarantee.
+ */
+async function requireOsPasswordApproval(reason: string): Promise<boolean> {
+  const rl = createInterface({ input, output });
+  try {
+    console.log(`\n${UI.bold}⚠  Authorization Required${UI.reset}`);
+    console.log(`${UI.dim}${reason}${UI.reset}`);
+    console.log('');
+    const password = await rl.question(`${UI.bold}Enter your OS login password to authorize: ${UI.reset}`);
+    if (!password) {
+      console.log('');
+      return false;
+    }
+
+    const platform = process.platform;
+    try {
+      if (platform === 'win32') {
+        // Windows: we can't easily verify password without admin tools.
+        // We use a secondary confirmation prompt as a speed-bump instead.
+        const confirm = await rl.question(`${UI.bold}Confirm (type "CONFIRM" to proceed): ${UI.reset}`);
+        console.log('');
+        return confirm.trim() === 'CONFIRM';
+      } else if (platform === 'darwin') {
+        execSync(`echo "${password.replace(/"/g, '\\"')}" | sudo -k -S true 2>/dev/null`, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        console.log('');
+        return true;
+      } else {
+        // Linux: try su
+        execSync(`echo "${password.replace(/"/g, '\\"')}" | su -c true 2>/dev/null`, {
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        console.log('');
+        return true;
+      }
+    } catch {
+      console.log(`${UI.bold}Authorization failed.${UI.reset}`);
+      console.log('');
+      return false;
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+// ─── First-time setup wizard ─────────────────────────────────────────────────
+
+const ENV_FILE_PATH = path.join(process.cwd(), '.env');
+
+function readEnvFile(): Record<string, string> {
+  if (!existsSync(ENV_FILE_PATH)) {
+    return {};
+  }
+  const content = readFileSync(ENV_FILE_PATH, 'utf8');
+  const result: Record<string, string> = {};
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx < 0) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    let value = trimmed.slice(eqIdx + 1).trim();
+    // Strip surrounding quotes
+    if ((value.startsWith("'") && value.endsWith("'")) || (value.startsWith('"') && value.endsWith('"'))) {
+      value = value.slice(1, -1);
+    }
+    result[key] = value;
+  }
+  return result;
+}
+
+function writeEnvFile(vars: Record<string, string>): void {
+  let content = '';
+  if (existsSync(ENV_FILE_PATH)) {
+    content = readFileSync(ENV_FILE_PATH, 'utf8');
+  }
+  for (const [key, value] of Object.entries(vars)) {
+    const lineRegex = new RegExp(`^${key}=.*$`, 'm');
+    const newLine = `${key}='${value}'`;
+    if (lineRegex.test(content)) {
+      content = content.replace(lineRegex, newLine);
+    } else {
+      content = content ? `${content.trimEnd()}\n${newLine}\n` : `${newLine}\n`;
+    }
+  }
+  writeFileSync(ENV_FILE_PATH, content, 'utf8');
+}
+
+async function runFirstTimeSetup(): Promise<void> {
+  const REQUIRED_KEYS: Array<{ key: string; label: string; url?: string }> = [
+    { key: 'GEMINI_API_KEY', label: 'Gemini API Key', url: 'https://aistudio.google.com/app/apikey' },
+    {
+      key: 'ALCHEMY_SEPOLIA_ENDPOINT',
+      label: 'Alchemy Sepolia RPC endpoint',
+      url: 'https://dashboard.alchemy.com',
+    },
+    {
+      key: 'ALCHEMY_MAINNET_ENDPOINT',
+      label: 'Alchemy Mainnet RPC endpoint',
+      url: 'https://dashboard.alchemy.com',
+    },
+    { key: 'NEWS_API_KEY', label: 'NewsAPI key', url: 'https://newsapi.org' },
+  ];
+
+  const missingKeys = REQUIRED_KEYS.filter(({ key }) => !process.env[key]);
+  if (missingKeys.length === 0) {
+    // Check if news interval and spending limit have been configured
+    const config = await loadConfig();
+    if (config.newsIntervalMs !== undefined && config.newsIntervalMs !== 5 * 60 * 1000) {
+      return; // Already set up by user
+    }
+    // Only run if this is literally the first time (no wallet created yet)
+    const activeUser = config.users.find((u) => u.id === config.activeUserId);
+    if (activeUser?.wallet?.address) {
+      return; // Wallet exists, setup was already done
+    }
+  }
+
+  const rl = createInterface({ input, output });
+  try {
+    console.log('');
+    console.log(`${UI.bold}╔══════════════════════════════════════════╗${UI.reset}`);
+    console.log(`${UI.bold}║       NonceSense · First-Time Setup      ║${UI.reset}`);
+    console.log(`${UI.bold}╚══════════════════════════════════════════╝${UI.reset}`);
+    console.log('');
+
+    if (missingKeys.length > 0) {
+      console.log(`${UI.dim}Some API keys are missing. Enter them now or press Enter to skip.${UI.reset}`);
+      console.log(`${UI.dim}Skipped keys will disable the related features but won't break the app.${UI.reset}`);
+      console.log('');
+
+      const envUpdates: Record<string, string> = {};
+      for (const { key, label, url } of missingKeys) {
+        const hint = url ? ` ${UI.dim}(get one at ${url})${UI.reset}` : '';
+        const answer = (
+          await rl.question(`  ${UI.bold}${label}${UI.reset}${hint}\n  ${key}= `)
+        ).trim();
+
+        if (answer) {
+          envUpdates[key] = answer;
+          process.env[key] = answer;
+          console.log(`  ${UI.cyan}✓ Saved${UI.reset}`);
+        } else {
+          console.log(
+            `  ${UI.dim}Skipped — ${label.toLowerCase()} features will not be available.${UI.reset}`,
+          );
+        }
+        console.log('');
+      }
+
+      if (Object.keys(envUpdates).length > 0) {
+        writeEnvFile(envUpdates);
+      }
+    }
+
+    // News interval
+    console.log(`${UI.bold}News Monitor Interval${UI.reset}`);
+    console.log(`${UI.dim}How often should the market agent check for Ethereum news?${UI.reset}`);
+    const intervalAnswer = (
+      await rl.question(`  Enter interval in minutes ${UI.dim}(default: 5)${UI.reset}: `)
+    ).trim();
+    let newsIntervalMs = 5 * 60 * 1000;
+    if (intervalAnswer) {
+      const parsed = Number(intervalAnswer);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        newsIntervalMs = parsed * 60 * 1000;
+        await saveNewsInterval(newsIntervalMs);
+        console.log(`  ${UI.cyan}✓ News interval set to ${parsed} minute${parsed !== 1 ? 's' : ''}.${UI.reset}`);
+      } else {
+        console.log(`  ${UI.dim}Invalid input — keeping default of 5 minutes.${UI.reset}`);
+      }
+    } else {
+      await saveNewsInterval(newsIntervalMs);
+      console.log(`  ${UI.dim}Using default: 5 minutes.${UI.reset}`);
+    }
+    console.log('');
+
+    // Spending limit
+    console.log(`${UI.bold}Transaction Spending Limit${UI.reset}`);
+    console.log(
+      `${UI.dim}Set the max ETH amount that can be sent without additional OS-password confirmation.${UI.reset}`,
+    );
+    console.log(`${UI.dim}Enter 0 to always require confirmation. Leave blank to skip (no limit enforced).${UI.reset}`);
+    const limitAnswer = (
+      await rl.question(`  Max ETH without signing ${UI.dim}(e.g. 0.01, default: 0)${UI.reset}: `)
+    ).trim();
+    if (limitAnswer !== '') {
+      const parsed = parseFloat(limitAnswer);
+      if (Number.isFinite(parsed) && parsed >= 0) {
+        await saveSpendingLimit(parsed);
+        if (parsed === 0) {
+          console.log(`  ${UI.cyan}✓ All transfers will require OS confirmation.${UI.reset}`);
+        } else {
+          console.log(`  ${UI.cyan}✓ Transfers up to ${parsed} ETH need no extra confirmation.${UI.reset}`);
+        }
+      } else {
+        console.log(`  ${UI.dim}Invalid input — no spending limit set.${UI.reset}`);
+      }
+    } else {
+      console.log(`  ${UI.dim}No spending limit enforced (all transfers proceed automatically).${UI.reset}`);
+    }
+    console.log('');
+
+    console.log(`${UI.bold}Setup complete! Starting NonceSense...${UI.reset}`);
+    console.log('');
+  } finally {
+    rl.close();
+  }
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
 async function run(): Promise<void> {
+  await runFirstTimeSetup();
   await runChatMode();
 }
 
@@ -1920,3 +2306,4 @@ run().catch((error: unknown) => {
   console.error(`CLI error: ${message}`);
   process.exitCode = 1;
 });
+

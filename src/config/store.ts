@@ -33,10 +33,12 @@ function getDefaultConfig(): AppConfig {
           blockedTokens: [],
           allowedProtocols: ['uniswap'],
           requireUserConfirmationAboveUsd: 100,
+          maxAutoApproveEth: 0,
         },
       },
     ],
     triggers: [],
+    newsIntervalMs: 5 * 60 * 1000,
   };
 }
 
@@ -158,6 +160,19 @@ export async function getActiveUserPrivateKey(): Promise<string | undefined> {
   const secrets = await loadSecrets();
   const activeUser = getOrCreateActiveUser(config);
   return secrets.userPrivateKeys[activeUser.id];
+}
+
+export async function saveNewsInterval(intervalMs: number): Promise<void> {
+  const config = await loadConfig();
+  config.newsIntervalMs = intervalMs;
+  await saveConfig(config);
+}
+
+export async function saveSpendingLimit(maxAutoApproveEth: number): Promise<void> {
+  const config = await loadConfig();
+  const activeUser = getOrCreateActiveUser(config);
+  activeUser.policy.maxAutoApproveEth = maxAutoApproveEth;
+  await saveConfig(config);
 }
 
 export function getConfigPath(): string {

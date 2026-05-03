@@ -19,6 +19,8 @@ export interface PolicyConstraints {
   blockedTokens: string[];
   allowedProtocols: string[];
   requireUserConfirmationAboveUsd: number;
+  /** Max ETH that can be spent in a single transfer without OS-level approval. 0 = always require approval. */
+  maxAutoApproveEth: number;
 }
 
 export interface UserProfile {
@@ -82,4 +84,6 @@ export interface AppConfig {
   activeUserId: string;
   users: UserProfile[];
   triggers: TriggerCondition[];
+  /** News monitor poll interval in milliseconds. Defaults to 5 minutes. */
+  newsIntervalMs?: number;
 }

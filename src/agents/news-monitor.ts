@@ -35,6 +35,7 @@ interface NewsApiResponse {
 export interface StartNewsMonitorInput {
   getWalletSnapshot: () => Promise<WalletSnapshot>;
   onRecommendation: (lines: string[]) => Promise<void>;
+  onRecommendationLogged?: (lines: string[]) => Promise<void>;
   intervalMs?: number;
 }
 
@@ -106,7 +107,8 @@ Task:
 Output style:
 - 4 to 8 concise lines.
 - Include: overall sentiment, suggested action (hold/buy/sell/reduce risk/watch), and WHY.
-- Mention risk caveat and that this is not financial advice.
+- Do NOT include generic boilerplate disclaimers (such as "crypto markets are highly volatile" or "this is not financial advice").
+- If there is a real specific risk from the news, mention it specifically.
 - Use only info from the provided data.
 
 Wallet snapshot:
@@ -123,7 +125,14 @@ ${JSON.stringify(articles, null, 2)}`;
   if (!text) {
     return ['No recommendation generated from this news batch.'];
   }
-  return normalizeLines(text);
+  // Strip any generic disclaimer lines the model might still insert
+  const lines = normalizeLines(text).filter(
+    (line) =>
+      !/crypto\s+markets?\s+are\s+highly\s+volatile/i.test(line) &&
+      !/this\s+is\s+not\s+financial\s+advice/i.test(line) &&
+      !/not\s+financial\s+advice/i.test(line),
+  );
+  return lines.length > 0 ? lines : ['No recommendation generated from this news batch.'];
 }
 
 export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
@@ -167,7 +176,7 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
         waitingAnnounced = false;
         nextAnalysisAt = Date.now() + intervalMs;
         await input.onRecommendation([
-          '[Market Agent] Balance detected. First news analysis will run in 5 minutes.',
+          '[Market Agent] Balance detected. First news analysis will run shortly.',
         ]);
         return;
       }
@@ -199,10 +208,15 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
       }
 
       const recommendation = await generateRecommendation(wallet, newest, process.env.GEMINI_API_KEY);
-      await input.onRecommendation([
+      const displayLines = [
         '[Market Agent] New Ethereum news signal:',
         ...recommendation,
-      ]);
+      ];
+      await input.onRecommendation(displayLines);
+      // Write to separate recommendations log if callback provided
+      if (input.onRecommendationLogged) {
+        await input.onRecommendationLogged(displayLines);
+      }
       nextAnalysisAt = Date.now() + intervalMs;
     } catch (error: unknown) {
       const text = error instanceof Error ? error.message : String(error);

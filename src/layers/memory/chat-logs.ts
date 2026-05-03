@@ -37,10 +37,25 @@ type LogEntry = ChatLogEntry | ActionLogEntry | ErrorLogEntry | SystemLogEntry;
 
 const LOG_DIRECTORY = path.join(process.cwd(), '.noncesense', 'logs');
 const LOG_FILE_PATH = path.join(LOG_DIRECTORY, 'events.jsonl');
+const RECOMMENDATIONS_LOG_FILE_PATH = path.join(LOG_DIRECTORY, 'recommendations.jsonl');
 
 async function appendLog(entry: LogEntry): Promise<void> {
   await mkdir(LOG_DIRECTORY, { recursive: true });
   await appendFile(LOG_FILE_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+export async function appendRecommendationLog(lines: string[]): Promise<void> {
+  await mkdir(LOG_DIRECTORY, { recursive: true });
+  const entry = {
+    timestamp: new Date().toISOString(),
+    type: 'market-recommendation',
+    lines,
+  };
+  await appendFile(RECOMMENDATIONS_LOG_FILE_PATH, `${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+export function getRecommendationsLogPath(): string {
+  return RECOMMENDATIONS_LOG_FILE_PATH;
 }
 
 async function readLogs(): Promise<LogEntry[]> {
