@@ -34,4 +34,4 @@ npm-debug.log*
 *.bak
 *~
 
-secrects.json
+.noncesense/
