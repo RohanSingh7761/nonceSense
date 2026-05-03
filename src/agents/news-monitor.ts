@@ -36,6 +36,7 @@ export interface StartNewsMonitorInput {
   getWalletSnapshot: () => Promise<WalletSnapshot>;
   onRecommendation: (lines: string[]) => Promise<void>;
   onRecommendationLogged?: (lines: string[]) => Promise<void>;
+  getUserProfile?: () => Promise<string | undefined>;
   intervalMs?: number;
 }
 
@@ -88,6 +89,7 @@ async function generateRecommendation(
   wallet: WalletSnapshot,
   articles: NewsArticle[],
   apiKey: string | undefined,
+  userProfile: string | undefined,
 ): Promise<string[]> {
   if (!apiKey) {
     return [
@@ -97,6 +99,15 @@ async function generateRecommendation(
   }
   const ai = new GoogleGenAI({ apiKey });
   const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash';
+  const profileBlock = userProfile && userProfile.trim().length > 0
+    ? `User profile (verbatim, tailor the recommendation to these stated aims and preferences):
+${userProfile.trim()}
+
+`
+    : '';
+  const profileRule = userProfile && userProfile.trim().length > 0
+    ? '- Tailor the suggested action to align with the user profile above (aims, risk tolerance, tokens of interest).'
+    : '';
   const prompt = `You are a crypto market monitoring copilot.
 
 Task:
@@ -104,12 +115,13 @@ Task:
 2) Read wallet snapshot across networks.
 3) Give a practical recommendation in human tone.
 
-Output style:
+${profileBlock}Output style:
 - 4 to 8 concise lines.
 - Include: overall sentiment, suggested action (hold/buy/sell/reduce risk/watch), and WHY.
 - Do NOT include generic boilerplate disclaimers (such as "crypto markets are highly volatile" or "this is not financial advice").
 - If there is a real specific risk from the news, mention it specifically.
 - Use only info from the provided data.
+${profileRule}
 
 Wallet snapshot:
 ${JSON.stringify(wallet, null, 2)}
@@ -207,7 +219,13 @@ export function startNewsMonitor(input: StartNewsMonitorInput): () => void {
         return;
       }
 
-      const recommendation = await generateRecommendation(wallet, newest, process.env.GEMINI_API_KEY);
+      const userProfile = input.getUserProfile ? await input.getUserProfile() : undefined;
+      const recommendation = await generateRecommendation(
+        wallet,
+        newest,
+        process.env.GEMINI_API_KEY,
+        userProfile,
+      );
       const displayLines = [
         '[Market Agent] New Ethereum news signal:',
         ...recommendation,

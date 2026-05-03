@@ -134,6 +134,30 @@ export async function getRecentUserMessages(limit = 5): Promise<string[]> {
     .map((entry) => entry.message);
 }
 
+export async function countUserChatMessages(): Promise<number> {
+  const entries = await readLogs();
+  let count = 0;
+  for (const entry of entries) {
+    if (entry.type === 'chat' && entry.role === 'user') {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+export interface UserMessageWithTimestamp {
+  timestamp: string;
+  message: string;
+}
+
+export async function getRecentUserMessagesDetailed(limit = 60): Promise<UserMessageWithTimestamp[]> {
+  const entries = await readLogs();
+  return entries
+    .filter((entry): entry is ChatLogEntry => entry.type === 'chat' && entry.role === 'user')
+    .slice(-limit)
+    .map((entry) => ({ timestamp: entry.timestamp, message: entry.message }));
+}
+
 export interface ActionHistoryItem {
   timestamp: string;
   action: string;

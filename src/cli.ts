@@ -12,9 +12,13 @@ import {
   ensureActiveUserWallet,
   getActiveUserPrivateKey,
   getConfigPath,
+  hasUserProfile,
   loadConfig,
+  loadUserProfile,
+  saveHabitsThreshold,
   saveNewsInterval,
   saveSpendingLimit,
+  saveUserProfile,
   setActiveUserMode,
   setActiveUserWallet,
 } from './config/store.js';
@@ -48,6 +52,7 @@ import { evaluateExecutionPolicy } from './layers/policy/index.js';
 import { evaluateTrigger } from './layers/trigger/index.js';
 import type { Recommendation, UserMode } from './types/index.js';
 import { startNewsMonitor, type WalletSnapshot } from './agents/news-monitor.js';
+import { readHabits, startHabitsAgent, type Habit } from './agents/habits.js';
 
 type CommandName =
   | 'help'
@@ -103,9 +108,9 @@ const UNISWAP_TOKEN_LIST_URL = 'https://tokens.uniswap.org';
 const TOKEN_LIST_TTL_MS = 10 * 60 * 1000;
 let tokenListCache:
   | {
-      fetchedAt: number;
-      tokens: TokenListEntry[];
-    }
+    fetchedAt: number;
+    tokens: TokenListEntry[];
+  }
   | undefined;
 
 const MAX_CONTEXT_TURNS = 12;
@@ -113,6 +118,8 @@ const UI = {
   reset: '\x1b[0m',
   cyan: '\x1b[36m',
   magenta: '\x1b[35m',
+  yellow: '\x1b[33m',
+  green: '\x1b[32m',
   dim: '\x1b[2m',
   bold: '\x1b[1m',
 };
@@ -1805,6 +1812,14 @@ async function runChatMode(): Promise<void> {
       await logChatMessage('assistant', `[market-agent] ${line}`);
     }
   };
+  const emitHabitLines = async (lines: string[]): Promise<void> => {
+    for (const line of lines) {
+      console.log(`${UI.yellow}${line}${UI.reset}`);
+      await logChatMessage('assistant', `[habits-agent] ${line}`);
+    }
+  };
+  const formatHabitList = (habits: Habit[]): string[] =>
+    habits.map((h, i) => `  ${i + 1}. ${h.label} -> "${h.commandText}"`);
 
   if (initialized.created) {
     await emitAssistantLine('I created a new wallet for you (first-time setup).');
@@ -1816,35 +1831,103 @@ async function runChatMode(): Promise<void> {
   }
   const config = await loadConfig();
   const newsIntervalMs = config.newsIntervalMs ?? 5 * 60 * 1000;
+  const habitsThresholdInputs = config.habitsThresholdInputs ?? 10;
   const stopNewsMonitor = startNewsMonitor({
     getWalletSnapshot: buildWalletSnapshotForNewsAgent,
     onRecommendation: emitMarketLines,
     onRecommendationLogged: async (lines) => {
       await appendRecommendationLog(lines);
     },
+    getUserProfile: loadUserProfile,
     intervalMs: newsIntervalMs,
   });
   const intervalMins = Math.round(newsIntervalMs / 60000);
   await emitMarketLines([`[Market Agent] Live monitor started (checks Ethereum news every ${intervalMins} minute${intervalMins !== 1 ? 's' : ''}).`]);
+
+  let currentHabits: Habit[] = await readHabits();
+  const stopHabitsAgent = startHabitsAgent({
+    getUserProfile: loadUserProfile,
+    thresholdInputs: habitsThresholdInputs,
+    onHabitsUpdated: async (habits, isFirst) => {
+      currentHabits = habits;
+      if (habits.length === 0) {
+        return;
+      }
+      await emitHabitLines([
+        isFirst
+          ? '[Habits Agent] I noticed a few things you do often. Quick shortcuts:'
+          : '[Habits Agent] Updated shortcuts based on your recent activity:',
+        ...formatHabitList(habits),
+        'Type the number to run it, or /habits to see them again.',
+      ]);
+    },
+    onNotice: emitHabitLines,
+  });
+  await emitHabitLines([
+    `[Habits Agent] Watching for patterns (scans every ${habitsThresholdInputs} inputs).`,
+  ]);
+  if (currentHabits.length > 0) {
+    await emitHabitLines([
+      '[Habits Agent] Saved shortcuts:',
+      ...formatHabitList(currentHabits),
+      'Type the number to run it, or /habits to see them again.',
+    ]);
+  }
+
   const rl = createInterface({ input, output });
   let lastErrorText: string | undefined;
   let pendingStep: ActionStep | undefined;
   let pendingSwapConfirmation: PendingSwapConfirmation | undefined;
   try {
     while (true) {
-      const message = (await rl.question(`${UI.dim}> ${UI.reset}`)).trim();
-      if (!message) {
+      const rawInput = (await rl.question(`${UI.dim}> ${UI.reset}`)).trim();
+      if (!rawInput) {
         continue;
       }
-      await logChatMessage('user', message);
-      addContextTurn(contextWindow, 'user', message);
+      await logChatMessage('user', rawInput);
+      addContextTurn(contextWindow, 'user', rawInput);
       if (
-        message.toLowerCase() === 'exit' ||
-        message.toLowerCase() === 'quit' ||
-        message.toLowerCase() === '/exit'
+        rawInput.toLowerCase() === 'exit' ||
+        rawInput.toLowerCase() === 'quit' ||
+        rawInput.toLowerCase() === '/exit'
       ) {
         await logSystemEvent('chat-mode-exit');
         break;
+      }
+
+      if (rawInput.toLowerCase() === '/habits') {
+        if (currentHabits.length === 0) {
+          await emitHabitLines([
+            '[Habits Agent] No habits detected yet. Keep chatting — I will suggest shortcuts once patterns emerge.',
+          ]);
+        } else {
+          await emitHabitLines([
+            '[Habits Agent] Current shortcuts:',
+            ...formatHabitList(currentHabits),
+            'Type the number to run it.',
+          ]);
+        }
+        continue;
+      }
+
+      let message = rawInput;
+      if (/^\d+$/.test(rawInput) && currentHabits.length > 0) {
+        const idx = parseInt(rawInput, 10) - 1;
+        if (idx >= 0 && idx < currentHabits.length) {
+          const habit = currentHabits[idx];
+          await logSystemEvent('habit-number-used', {
+            habitId: habit.id,
+            label: habit.label,
+            commandText: habit.commandText,
+          });
+          await emitHabitLines([
+            `[Habits Agent] Running habit #${idx + 1}: ${habit.label}`,
+            `  -> ${habit.commandText}`,
+          ]);
+          message = habit.commandText;
+          await logChatMessage('user', message);
+          addContextTurn(contextWindow, 'user', message);
+        }
       }
 
       if (shouldExplainLastError(message) && lastErrorText) {
@@ -2066,6 +2149,7 @@ async function runChatMode(): Promise<void> {
       }
     }
   } finally {
+    stopHabitsAgent();
     stopNewsMonitor();
     rl.close();
   }
@@ -2188,7 +2272,8 @@ async function runFirstTimeSetup(): Promise<void> {
   ];
 
   const missingKeys = REQUIRED_KEYS.filter(({ key }) => !process.env[key]);
-  if (missingKeys.length === 0) {
+  const profileExists = await hasUserProfile();
+  if (missingKeys.length === 0 && profileExists) {
     // Check if news interval and spending limit have been configured
     const config = await loadConfig();
     if (config.newsIntervalMs !== undefined && config.newsIntervalMs !== 5 * 60 * 1000) {
@@ -2238,6 +2323,28 @@ async function runFirstTimeSetup(): Promise<void> {
       }
     }
 
+    // About You (free-form profile)
+    if (!profileExists) {
+      console.log(`${UI.bold}About You${UI.reset}`);
+      console.log(
+        `${UI.dim}Tell me a little about yourself and your main aim for creating this wallet.${UI.reset}`,
+      );
+      console.log(
+        `${UI.dim}(Anything you want me to remember — experience level, goals, tokens you care about, risk tolerance, etc.)${UI.reset}`,
+      );
+      const profileAnswer = await rl.question(`  ${UI.bold}You${UI.reset}: `);
+      const trimmedProfile = profileAnswer.trim();
+      if (trimmedProfile.length > 0) {
+        await saveUserProfile(profileAnswer);
+        console.log(`  ${UI.cyan}✓ Got it — I'll keep this in mind.${UI.reset}`);
+      } else {
+        console.log(
+          `  ${UI.dim}Skipped — you can share later and I'll still work normally.${UI.reset}`,
+        );
+      }
+      console.log('');
+    }
+
     // News interval
     console.log(`${UI.bold}News Monitor Interval${UI.reset}`);
     console.log(`${UI.dim}How often should the market agent check for Ethereum news?${UI.reset}`);
@@ -2283,6 +2390,32 @@ async function runFirstTimeSetup(): Promise<void> {
       }
     } else {
       console.log(`  ${UI.dim}No spending limit enforced (all transfers proceed automatically).${UI.reset}`);
+    }
+    console.log('');
+
+    // Habits threshold
+    console.log(`${UI.bold}Habits Agent${UI.reset}`);
+    console.log(
+      `${UI.dim}The habits agent periodically scans your chat log to detect patterns that match your aims,${UI.reset}`,
+    );
+    console.log(
+      `${UI.dim}then offers them as numbered shortcuts. How many inputs between scans?${UI.reset}`,
+    );
+    const habitsAnswer = (
+      await rl.question(`  Analyze after every N inputs ${UI.dim}(default: 10)${UI.reset}: `)
+    ).trim();
+    if (habitsAnswer) {
+      const parsed = Number(habitsAnswer);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        await saveHabitsThreshold(parsed);
+        console.log(`  ${UI.cyan}✓ Habits agent will scan every ${parsed} inputs.${UI.reset}`);
+      } else {
+        await saveHabitsThreshold(10);
+        console.log(`  ${UI.dim}Invalid input — using default of 10.${UI.reset}`);
+      }
+    } else {
+      await saveHabitsThreshold(10);
+      console.log(`  ${UI.dim}Using default: every 10 inputs.${UI.reset}`);
     }
     console.log('');
 

@@ -8,6 +8,7 @@ import type { AppConfig, UserMode } from '../types/index.js';
 const CONFIG_DIRECTORY = path.join(process.cwd(), '.noncesense');
 const CONFIG_FILE_PATH = path.join(CONFIG_DIRECTORY, 'config.json');
 const SECRETS_FILE_PATH = path.join(CONFIG_DIRECTORY, 'secrets.json');
+const USER_PROFILE_FILE_PATH = path.join(CONFIG_DIRECTORY, 'user-profile.txt');
 const DEFAULT_USER_ID = 'default-user';
 
 interface SecretsStore {
@@ -173,6 +174,41 @@ export async function saveSpendingLimit(maxAutoApproveEth: number): Promise<void
   const activeUser = getOrCreateActiveUser(config);
   activeUser.policy.maxAutoApproveEth = maxAutoApproveEth;
   await saveConfig(config);
+}
+
+export async function saveHabitsThreshold(thresholdInputs: number): Promise<void> {
+  const config = await loadConfig();
+  config.habitsThresholdInputs = thresholdInputs;
+  await saveConfig(config);
+}
+
+export async function saveUserProfile(text: string): Promise<void> {
+  await mkdir(CONFIG_DIRECTORY, { recursive: true });
+  await writeFile(USER_PROFILE_FILE_PATH, text, 'utf8');
+}
+
+export async function loadUserProfile(): Promise<string | undefined> {
+  try {
+    const raw = await readFile(USER_PROFILE_FILE_PATH, 'utf8');
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function hasUserProfile(): Promise<boolean> {
+  try {
+    await access(USER_PROFILE_FILE_PATH, fsConstants.F_OK);
+    const raw = await readFile(USER_PROFILE_FILE_PATH, 'utf8');
+    return raw.trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function getUserProfilePath(): string {
+  return USER_PROFILE_FILE_PATH;
 }
 
 export function getConfigPath(): string {

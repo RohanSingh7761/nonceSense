@@ -86,4 +86,6 @@ export interface AppConfig {
   triggers: TriggerCondition[];
   /** News monitor poll interval in milliseconds. Defaults to 5 minutes. */
   newsIntervalMs?: number;
+  /** Number of user inputs between habit analyses. Defaults to 10. */
+  habitsThresholdInputs?: number;
 }
